@@ -1,0 +1,30 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+backoff = "*"
+requests = "*"
+fastapi = "*"
+uvicorn = "*"
+python-socketio = "*"
+aiofiles = "*"
+pyotp = "*"
+aiosqlite = "*"
+cryptography = "*"
+python-dotenv = "*"
+aiohttp = "*"
+tiktoken = "*"
+openai = "*"
+pydantic = "*"
+scikit-learn = "*"
+numpy = "*"
+nltk = "*"
+dotenv = "*"
+pycryptodome = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.14"
