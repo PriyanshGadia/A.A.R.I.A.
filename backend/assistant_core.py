@@ -155,17 +155,17 @@ def _make_store_instance(storage_path: Optional[str] = None):
     """
     if _HAS_EXTERNAL_STORE and ExternalSecureStorageAsync is not None:
         try:
-            # try instantiate using common kwarg names; if it fails, fall back
-            try:
-                return ExternalSecureStorageAsync(db_path=storage_path)
-            except TypeError:
-                # try no-arg
+            # --- THIS IS THE FIX ---
+            # If storage_path is None, call with no args to use the default DB_PATH
+            if storage_path is None:
                 return ExternalSecureStorageAsync()
+            # Otherwise, pass the explicit path
+            return ExternalSecureStorageAsync(db_path=storage_path)
+            # --- END FIX ---
         except Exception:
             logger.warning("External SecureStorageAsync exists but instantiation failed; falling back to in-memory.")
             return InMemorySecureStore(db_path=storage_path)
     return InMemorySecureStore(db_path=storage_path)
-
 
 # ---------------------------
 # Utilities

@@ -878,7 +878,12 @@ class CognitionCore:
         llm_ok = health_data["llm_health"].get("available", False)
         storage_ok = health_data["storage_health"].get("working", False)
 
-        if base_ok and llm_ok and storage_ok:
+        # --- FIX: Check for warmup flag from base_health ---
+        is_warming_up = health_data["base_health"].get("uptime_seconds", 31) < 30
+        if is_warming_up and (not llm_ok or not storage_ok):
+            health_data["overall_status"] = "warming_up"
+        # --- END FIX ---
+        elif base_ok and llm_ok and storage_ok:
             health_data["overall_status"] = "healthy"
         elif not any([base_ok, llm_ok, storage_ok]):
             health_data["overall_status"] = "error"

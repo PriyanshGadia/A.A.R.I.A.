@@ -151,12 +151,9 @@ class PersonaCore:
         # initialize to None here; initialize() will wire from core if present.
         self.memory_manager: Optional[Any] = None
 
-        # Wire proactive communicator defensively
-        try:
-            self.proactive = ProactiveCommunicator(self, hologram_call_fn=hologram_state, concurrency=1)
-        except Exception as e:
-            logger.warning(f"Failed to create ProactiveCommunicator: {e}")
-            self.proactive = ProactiveCommunicator(self, hologram_call_fn=None, concurrency=1)
+        # --- FIX: Proactive communicator will be injected by main.py ---
+        self.proactive: Optional[ProactiveCommunicator] = None
+        # --- END FIX ---
 
         # Daemon control
         self._daemon_tasks: List[asyncio.Task] = []
@@ -505,7 +502,7 @@ class PersonaCore:
             logger.error(f"❌ Failed to load persistent memory: {e}", exc_info=True)
             self.memory_index = []
 
-    async def _save_persistent_memory(self) -> None:
+    async def save_persistent_memory(self) -> None:
         """Save persistent memory. Prefer MemoryManager's save API, fallback to core.store."""
         mm = getattr(self, "memory_manager", None)
         memory_data = {
@@ -799,7 +796,7 @@ class PersonaCore:
                             if inspect.iscoroutine(maybe):
                                 await maybe
                         else:
-                            await self._save_persistent_memory()
+                            await self.save_persistent_memory()
                     return memory_id
 
                 except Exception as e:
@@ -842,7 +839,7 @@ class PersonaCore:
             # Periodic save of aggregated index
             self._interaction_count += 1
             if self._interaction_count % MEMORY_SAVE_INTERVAL == 0:
-                await self._save_persistent_memory()
+                await self.save_persistent_memory()
 
             return memory_id
 
@@ -1771,7 +1768,7 @@ class PersonaCore:
                 await asyncio.sleep(MAINTENANCE_LOOP_INTERVAL_SEC + random.uniform(-5, 5))
                 # Save memory index
                 try:
-                    await self._save_persistent_memory()
+                    await self.save_persistent_memory()
                 except Exception:
                     logger.debug("Maintenance: failed to save memory index (non-fatal)")
                 # Persist transcripts/semantic if memory_manager present
@@ -1873,11 +1870,11 @@ class PersonaCore:
                         if inspect.iscoroutine(maybe):
                             await maybe
                         logger.info("MemoryManager: saved index on PersonaCore.close()")
-                    elif hasattr(mm, "_save_persistent_memory"):
-                        maybe = mm._save_persistent_memory()
+                    elif hasattr(mm, "save_persistent_memory"):
+                        maybe = mm.save_persistent_memory()
                         if inspect.iscoroutine(maybe):
                             await maybe
-                        logger.info("MemoryManager: invoked _save_persistent_memory() on close")
+                        logger.info("MemoryManager: invoked save_persistent_memory() on close")
                     # persist transcript/semantic if supported
                     if hasattr(mm, "save_transcript_store"):
                         maybe = mm.save_transcript_store(list(self.transcript_store))
@@ -1890,7 +1887,7 @@ class PersonaCore:
                 except Exception as e:
                     logger.warning(f"MemoryManager save on close failed: {e}", exc_info=True)
             # Local fallback
-            await self._save_persistent_memory()
+            await self.save_persistent_memory()
             await self._persist_critical_data()
             # Clean up expired cache entries
             current_time = time.time()

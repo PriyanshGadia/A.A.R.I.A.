@@ -221,7 +221,9 @@ class BaseLLMAdapter(ABC):
     def __init__(self, config: AdapterConfig):
         self.config = config
         self.logger = logging.getLogger(f"AARIA.LLM.{config.provider.value}")
-        self.session: Optional[aiohttp.ClientSession] = None
+        # --- FIX: Remove self.session from __init__ ---
+        # self.session: Optional[aiohttp.ClientSession] = None 
+        # --- END FIX ---
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=config.circuit_breaker_threshold,
             recovery_timeout=config.circuit_breaker_timeout
@@ -242,22 +244,14 @@ class BaseLLMAdapter(ABC):
             raise LLMConfigurationError("Circuit breaker threshold must be at least 1")
 
     async def __aenter__(self):
-        """Async context manager entry with optimized connection pooling"""
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.config.timeout),
-            connector=aiohttp.TCPConnector(
-                limit=100,  # Max simultaneous connections
-                limit_per_host=20,  # Max per endpoint
-                keepalive_timeout=30,
-            ),
-            headers=self._get_headers()
-        )
+        """Async context manager entry - NO session created here."""
+        # --- FIX: Do not create self.session here ---
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit with proper cleanup"""
-        if self.session:
-            await self.session.close()
+        """Async context manager exit - NO session to close."""
+        # --- FIX: No self.session to close ---
+        pass
 
     @abstractmethod
     def _get_headers(self) -> Dict[str, str]:
@@ -321,27 +315,33 @@ class BaseLLMAdapter(ABC):
         try:
             payload = self._build_payload(request)
             
-            # Record metrics and execute request
-            with llm_request_duration.labels(
-                provider=self.config.provider.value, 
-                model=self.config.model
-            ).time():
-                async with self.session.post(
-                    self._get_chat_url(), 
-                    json=payload
-                ) as response:
-                    
-                    if response.status == 429:
-                        llm_errors_total.labels(
-                            provider=self.config.provider.value,
-                            model=self.config.model,
-                            error_type="rate_limit"
-                        ).inc()
-                        self.circuit_breaker.on_failure()
-                        raise LLMRateLimitError("Rate limit exceeded")
-                    
-                    response.raise_for_status()
-                    response_data = await response.json()
+            # --- FIX: Create and manage the session *inside* the method ---
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+                headers=self._get_headers()
+            ) as session:
+            # --- END FIX ---
+                # Record metrics and execute request
+                with llm_request_duration.labels(
+                    provider=self.config.provider.value, 
+                    model=self.config.model
+                ).time():
+                    async with session.post(  # Use the new session
+                        self._get_chat_url(), 
+                        json=payload
+                    ) as response:
+                        
+                        if response.status == 429:
+                            llm_errors_total.labels(
+                                provider=self.config.provider.value,
+                                model=self.config.model,
+                                error_type="rate_limit"
+                            ).inc()
+                            self.circuit_breaker.on_failure()
+                            raise LLMRateLimitError("Rate limit exceeded")
+                        
+                        response.raise_for_status()
+                        response_data = await response.json()
             
             # Parse response and update metrics
             llm_response = self._parse_response(response_data)
@@ -426,7 +426,7 @@ class BaseLLMAdapter(ABC):
             self._update_circuit_breaker_metrics()
             self.logger.error(f"Unexpected error in LLM request after {latency:.2f}s: {e}")
             raise LLMError(f"LLM request failed after {latency:.2f}s: {e}") from e
-
+        
     async def stream_chat(self, request: LLMRequest) -> AsyncGenerator[str, None]:
         """
         Execute chat completion as an async generator for streaming responses

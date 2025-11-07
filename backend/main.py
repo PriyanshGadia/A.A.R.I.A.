@@ -366,7 +366,12 @@ class AARIASystem:
                 pass
             self.components["persona"] = persona
 
+        # --- FIX: Inject the (not-yet-created) proactive instance placeholder ---
+            # This reference will be populated later, but the attribute must exist.
+            persona.proactive = self.components.get("proactive") 
+            # --- END FIX ---
             # Cognition core (optional but recommended)
+
             if CognitionCore is not None:
                 try:
                     self.logger.info("Initializing Cognition Core...")
@@ -454,8 +459,10 @@ class AARIASystem:
 
                     # Make persona and assistant aware of proactive for convenience
                     try:
-                        setattr(persona, "proactive", proactive)
-                        setattr(assistant, "proactive", proactive)
+                        # --- FIX: Directly set the attribute ---
+                        persona.proactive = proactive
+                        assistant.proactive = proactive
+                        # --- END FIX ---
                     except Exception:
                         pass
 
@@ -604,7 +611,11 @@ class AARIASystem:
         if not persona:
             self.logger.debug("_persist_persona_quick: missing persona")
             return False
-        candidates = ["flush_memories", "save_persistent_memory", "persist_memories", "save_all", "save", "close", "persist"]
+        
+        # --- FIX: Removed "close" from this list ---
+        candidates = ["flush_memories", "save_persistent_memory", "persist_memories", "save_all", "save", "persist"]
+        # --- END FIX ---
+
         for name in candidates:
             if not hasattr(persona, name):
                 continue
@@ -622,7 +633,6 @@ class AARIASystem:
                 await asyncio.sleep(0.05)
         self.logger.error("Persona quick persist failed (no candidate succeeded)")
         return False
-
     # ---------------------------
     # CLI Interaction
     # ---------------------------
