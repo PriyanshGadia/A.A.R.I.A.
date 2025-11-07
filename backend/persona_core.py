@@ -714,7 +714,7 @@ class PersonaCore:
         try:
             # --- [CRITICAL FIX] ---
             # Call with positional args (self, subject_id, query, limit)
-            # instead of keyword args, as required by your memory_manager_sqlite.py
+            # as required by your memory_manager_sqlite.py
             if hasattr(self.memory_manager, "search_memories"):
                 memories = await self.memory_manager.search_memories(
                     subject_identity_id,
@@ -1054,14 +1054,13 @@ class PersonaCore:
                 logger.warning("save_persistent_memory: No MemoryManager available.")
                 return
 
-            # This is the identity for the main owner
-            identity_id = "owner_primary"
+            identity_id = "owner_primary" # Define the identity for these indices
 
+            # --- [CRITICAL FIX] ---
+            # save_index expects a dict, not a list. Wrap it.
             if hasattr(mm, "save_index"):
-                # The 'memory_index' cache is a list, wrap it in a dict
                 await mm.save_index({"data": list(self.memory_index)})
             
-            # --- [CRITICAL FIX] ---
             # Pass the identity_id as the first argument
             if hasattr(mm, "save_transcript_store"):
                 await mm.save_transcript_store(identity_id, list(self.transcript_store))
@@ -1073,7 +1072,7 @@ class PersonaCore:
             logger.info("💾 All memory indices successfully persisted.")
         except Exception as e:
             logger.error(f"Failed to save persistent memory: {e}", exc_info=True)
-            raise e # Re-raise to be caught by the shutdown handler
+            # Do not re-raise, allow shutdown to continue
 
 
     async def close(self) -> None:

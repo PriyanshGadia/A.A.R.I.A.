@@ -522,8 +522,7 @@ class CognitionCore:
         even if the LLM adds conversational text.
         """
         start_time = _now_loop_time()
-        # ... (Hologram, performance, dedupe, fast reasoning, circuit breaker, rate limit logic is all unchanged) ...
-        
+
         node_id = f"cog_task_{uuid.uuid4().hex[:8]}"
         link_id = f"link_cog_{node_id}"
         holo_ok = False
@@ -531,32 +530,38 @@ class CognitionCore:
             holo_ok = await self._safe_holo_spawn(node_id, "cognition", f"Reasoning: {query[:20]}...", 5, "CognitionCore", link_id)
             if holo_ok: await self._safe_holo_set_active("CognitionCore")
         except Exception: holo_ok = False
+        
         self.performance_metrics.reasoning_requests += 1
         context = context or {}
         request_hash = self._hash_request(query, context)
+
         if await self._is_duplicate_request(request_hash):
             return [{"tool_name": "chat_response", "params": {"response_text": "Processing previous request..."}}]
+
         fast_response = self._try_fast_reasoning(query)
         if fast_response:
             latency = _now_loop_time() - start_time
             plan = [{"tool_name": "chat_response", "params": {"response_text": fast_response}}]
             await self._record_trace(query, fast_response, reasoning_mode, latency, 0.9)
+            if holo_ok: await self._cleanup_hologram_task(node_id, link_id) # Cleanup on fast path
             return plan
+
         if not await self.llm_circuit_breaker.can_execute():
             logger.warning("Circuit breaker open")
             self.performance_metrics.circuit_breaker_trips += 1
             fallback_text = self._get_circuit_breaker_fallback(query)
             fallback_plan = [{"tool_name": "chat_response", "params": {"response_text": fallback_text}}]
             await self._record_trace(query, fallback_text, reasoning_mode, None, 0.3)
-            if holo_ok: await self._safe_holo_set_error(node_id)
+            if holo_ok: await self._safe_holo_set_error(node_id); await self._cleanup_hologram_task(node_id, link_id)
             return fallback_plan
+
         if not await self.rate_limiter.acquire():
             logger.warning("Rate limit exceeded")
             self.performance_metrics.rate_limit_hits += 1
             fallback_text = self._get_rate_limit_fallback(query)
             fallback_plan = [{"tool_name": "chat_response", "params": {"response_text": fallback_text}}]
             await self._record_trace(query, fallback_text, reasoning_mode, None, 0.4)
-            if holo_ok: await self._safe_holo_set_error(node_id)
+            if holo_ok: await self._safe_holo_set_error(node_id); await self._cleanup_hologram_task(node_id, link_id)
             return fallback_plan
 
         # LLM path
@@ -635,8 +640,12 @@ class CognitionCore:
                     await asyncio.sleep(0.5 * (2 ** attempt))
             
                 finally:
+                    # --- [FIXED] ---
+                    # Ensure cleanup happens even inside the loop
                     if holo_ok:
                         await self._cleanup_hologram_task(node_id, link_id)
+                        holo_ok = False # Prevent double cleanup
+                    # --- [END FIX] ---
 
         # final fallback
         fallback_text = self._get_fallback_reasoning(query)
@@ -645,7 +654,19 @@ class CognitionCore:
         if holo_ok:
             await self._cleanup_hologram_task(node_id, link_id)
         return fallback_plan
-            
+    
+    async def _cleanup_hologram_task(self, node_id: str, link_id: str):
+        """
+        [NEW METHOD]
+        This was the missing helper function for hologram cleanup.
+        """
+        try:
+            await self._safe_holo_set_idle("CognitionCore")
+            await self._safe_holo_despawn(node_id, link_id)
+        except Exception:
+            pass # Non-fatal
+
+
     # --- [REPLACED] ---
     # This method is no longer a simple 'reason' call.
     # It now *requires* the LLM to return a JSON object,

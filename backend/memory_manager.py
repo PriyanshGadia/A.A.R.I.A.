@@ -148,7 +148,7 @@ class MemoryManager:
 
             # --- [CRITICAL FIX] ---
             # The encryption layer (crypto.py) can only encrypt dicts.
-            # If the object is a list (like a segment_index), wrap it.
+            # If the object is a list (like a segment_index or audit_log), wrap it.
             payload = obj
             if not isinstance(obj, dict):
                 # This wrapper makes it a dictionary that can be encrypted.
@@ -164,16 +164,21 @@ class MemoryManager:
                 elif "semantic" in key: type_name = "semantic_index"
                 else: type_name = "generic_data"
             
-            # Pass the (potentially wrapped) payload to the store
-            maybe = put(key, type_name, payload)
+            maybe = put(key, type_name, payload) # Pass the (potentially wrapped) payload
 
             if inspect.iscoroutine(maybe):
                 await maybe
             return True
         except Exception as e:
+            # We add exc_info=True to get the full traceback for these errors
             logger.warning(f"_store_put failed for key {key} (type: {type_name}): {e}", exc_info=True)
             return False
+        
     async def _store_get(self, key: str) -> Optional[Any]:
+        """
+        [UPGRADED]
+        This method now unwraps the {"data": ...} wrapper if it exists.
+        """
         if self.store is None:
             async with self._locks["store"]:
                 return self._inmem.get(key)
@@ -185,9 +190,15 @@ class MemoryManager:
                     except Exception: return None
                 return None
             maybe = get(key)
-            if inspect.iscoroutine(maybe):
-                return await maybe
-            return maybe
+            data = await maybe if inspect.iscoroutine(maybe) else maybe
+            
+            # --- [CRITICAL FIX] ---
+            # If this is a wrapped list, unwrap it before returning
+            if isinstance(data, dict) and "data" in data and len(data) == 1:
+                return data["data"]
+            # --- [END FIX] ---
+            
+            return data
         except Exception as e:
             logger.debug(f"_store_get failed for {key}: {e}")
             async with self._locks["store"]:
@@ -295,18 +306,34 @@ class MemoryManager:
     # Auditing (remains the same)
     # -----------------------
     async def _audit(self, actor: str, action: str, target: str, details: Optional[Dict] = None):
-        """Append audit entry (append-only)."""
+        """[UPGRADED] Append audit entry (append-only)."""
         entry = {
-            "ts": _now_ts(), "actor": actor or "system", "action": action,
-            "target": target, "details": details or {}
+            "ts": _now_ts(),
+            "actor": actor or "system",
+            "action": action,
+            "target": target,
+            "details": details or {}
         }
         key = self._audit_key()
         async with self._locks["audit"]:
-            existing = await self._store_get(key) or []
+            # --- [CRITICAL FIX] ---
+            # Get the raw object (which might be a dict {"data": []})
+            raw_existing = await self._store_get(key)
+            
+            # Initialize as a list, which _store_put will wrap
+            existing = []
+            if isinstance(raw_existing, list):
+                existing = raw_existing
+            elif isinstance(raw_existing, dict) and "data" in raw_existing:
+                existing = raw_existing["data"]
+            # --- [END FIX] ---
+
             existing.append(entry)
             if len(existing) > _MAX_AUDIT_ENTRIES:
                 existing = existing[-_MAX_AUDIT_ENTRIES:]
-            await self._store_put(key, existing, AUDIT_NAMESPACE) # Use correct type
+            
+            # _store_put will now wrap this list in a dict
+            await self._store_put(key, existing, AUDIT_NAMESPACE)
 
     # -----------------------
     # Identity containers (remains the same)
