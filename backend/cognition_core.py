@@ -267,13 +267,16 @@ class CognitionCore:
     # --- [UPGRADED] TOOL MANIFEST ---
     # This version has the CORRECT, SIMPLE commands that
     # your SecurityOrchestrator and IdentityManager are built to understand.
+    # --- [FINAL UPGRADED] TOOL MANIFEST ---
+    # This version has the CORRECT, SIMPLE commands that
+    # your SecurityOrchestrator and IdentityManager are built to understand.
     TOOL_MANIFEST = [
         {
             "tool_name": "security_command",
             "description": (
                 "Manages user identity, access control, and permissions for all users (Owner and third-parties). "
-                "Use this for: creating new users (e.g., 'I'm Jake'), setting/changing a user's preferred name (e.g., 'call me Skye'), "
-                "adding/removing privileged users (e.g., 'my friend Jake...'), or listing users/devices."
+                "Use this for: creating new users, setting/changing a user's preferred name, "
+                "adding/removing privileged users, or listing users/devices."
             ),
             "parameters": {
                 "type": "object",
@@ -282,10 +285,11 @@ class CognitionCore:
                         "type": "string",
                         "description": (
                             "The full, explicit, CLI-style security command string. "
+                            "This command is passed directly to the security router. "
                             "Examples: "
-                            "'set_preferred_name name=Skye', "
-                            "'add_privileged_user name=Jake relationship=friend', "
-                            "'list_identities'"
+                            "'identity set_preferred_name name=NewName', "
+                            "'access add_privileged_user name=Jake relationship=friend', "
+                            "'identity list'"
                         )
                     }
                 },
@@ -296,7 +300,7 @@ class CognitionCore:
             "tool_name": "autonomy_action",
             "description": (
                 "Enqueues a task for the autonomous system to execute. Use this for: "
-                "setting reminders (e.g., 'remind me about Yash's birthday'), adding/listing calendar events, managing contacts, or sending notifications."
+                "setting reminders, adding/listing calendar events, managing contacts, or sending notifications."
             ),
             "parameters": {
                 "type": "object",
@@ -309,7 +313,7 @@ class CognitionCore:
                         "type": "object",
                         "description": (
                             "A JSON object of parameters for the action. "
-                            "Example for calendar: {'title': 'Yash Birthday', 'datetime': '2025-12-12T09:00:00'} "
+                            "Example for calendar: {'title': 'Birthday', 'datetime': '2025-12-12T09:00:00'} "
                         )
                     }
                 },
@@ -318,7 +322,7 @@ class CognitionCore:
         },
         {
             "tool_name": "chat_response",
-            "description": "Used for all general conversation, answering questions (e.g. 'who are you?'), or when no other tool is appropriate.",
+            "description": "Used for all general conversation, answering questions, or when no other tool is appropriate.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -519,7 +523,7 @@ class CognitionCore:
                      reasoning_mode: ReasoningMode = ReasoningMode.BALANCED,
                      use_llm: bool = True, max_retries: int = 2) -> List[Dict[str, Any]]:
         """
-        [UPGRADED - v4]
+        [UPGRADED - v5]
         This version now robustly finds the JSON block
         even if the LLM adds conversational text.
         """
@@ -586,34 +590,52 @@ class CognitionCore:
                     latency = _now_loop_time() - start_time
                     raw_response = self._sanitize_response(response_content)
                     
-                    # --- [START OF ROBUST PARSING LOGIC v2] ---
+                    # --- [START OF ROBUST PARSING LOGIC v3] ---
                     plan = []
                     try:
-                        # Find the first JSON list or object
-                        json_match = re.search(r'\[.*\]|\{.*\}', raw_response, re.DOTALL)
+                        # Find *all* potential JSON blocks (list or dict)
+                        # This regex finds text starting with { or [ and ending with } or ]
+                        # It is *not* perfect but is much better than the previous one.
+                        json_matches = re.findall(r'(\{[\s\S]*\}|\[[\s\S]*\])', raw_response, re.DOTALL)
                         
-                        if json_match:
-                            json_str = json_match.group(0)
-                            plan_data = json.loads(json_str)
-                            
-                            if isinstance(plan_data, dict):
-                                plan = [plan_data]
-                            elif isinstance(plan_data, list):
-                                plan = plan_data
-                            else:
-                                raise ValueError("Parsed JSON is not a dict or list")
-                        else:
-                            raise ValueError("No JSON list or object found in LLM response")
-                        
-                        if not plan or not isinstance(plan[0], dict) or "tool_name" not in plan[0]:
-                            raise ValueError(f"Malformed plan: {plan}")
+                        if not json_matches:
+                            raise ValueError("No JSON-like blocks (starting with { or [) found in LLM response")
 
+                        # Iterate in REVERSE order. The LLM often puts chat first
+                        # and the valid JSON block last.
+                        for json_str in reversed(json_matches):
+                            try:
+                                plan_data = json.loads(json_str)
+                                
+                                # We found valid JSON, now validate its structure
+                                if isinstance(plan_data, dict):
+                                    plan = [plan_data] # Convert single tool call to list
+                                elif isinstance(plan_data, list):
+                                    plan = plan_data # It's already a list
+                                else:
+                                    continue # Not a dict or list, try next match
+
+                                if plan and isinstance(plan[0], dict) and "tool_name" in plan[0]:
+                                    # This is a valid plan! Break the loop.
+                                    break 
+                                else:
+                                    # It was valid JSON, but not a valid *plan*.
+                                    plan = [] # Reset plan and try the next match
+                                    continue
+
+                            except json.JSONDecodeError:
+                                # This block was not valid JSON (e.g., "[*witty tone*]"), try the next one.
+                                continue
+                        
+                        if not plan:
+                             raise ValueError(f"No valid *plan* found in any JSON block.")
+                    
                     except Exception as json_err:
                         logger.warning(f"LLM failed to return valid JSON plan (using adapter): {json_err}. Raw: {raw_response}")
                         # ROBUST FALLBACK: Return the *raw text* as a chat_response
                         plan = [{"tool_name": "chat_response", "params": {"response_text": raw_response}}]
                     
-                    # --- [END OF ROBUST PARSING LOGIC v2] ---
+                    # --- [END OF ROBUST PARSING LOGIC v3] ---
 
                     self.performance_metrics.successful_reasoning += 1
                     self.performance_metrics.record_latency(reasoning_mode.value, latency)
@@ -1157,9 +1179,9 @@ class CognitionCore:
     # --- [END REPLACED] ---
     def _build_enhanced_prompt(self, query: str, context: Dict[str, Any], reasoning_mode: ReasoningMode) -> List[Dict[str, str]]:
         """
-        [UPGRADED - v3]
-        This prompt is now *stricter* and removes hard-coded user examples.
-        It uses generic examples to guide the LLM.
+        [UPGRADED - v4]
+        This prompt is now stricter and removes ALL hard-coded user examples.
+        It uses GENERIC, UNRELATED examples to guide the LLM.
         """
         ev: EmotionalVector = self.cognitive_state["emotional_vector"]
         
@@ -1169,9 +1191,9 @@ class CognitionCore:
         
         # --- [CRITICAL PROMPT FIX] ---
         # Instructions are now more direct and force JSON.
-        # Hardcoded user-specific examples are REMOVED.
+        # Hardcoded user-specific examples are REMOVED and replaced with generic ones.
         system_parts = [
-            base_system_prompt, # This includes the personality, user name, date, etc.
+            base_system_prompt,
             "\n--- AGENTIC INSTRUCTIONS ---",
             "You are an agentic router. Your ONLY goal is to analyze the user's query and output a JSON list of tool calls.",
             "You MUST *ALWAYS* respond with a valid JSON list.",
@@ -1182,10 +1204,10 @@ class CognitionCore:
             "--- TOOL MANIFEST END ---",
             f"Current Emotional Context: Calm {ev.calm:.2f}, Alert {ev.alert:.2f}, Stress {ev.stress:.2f}",
             "--- GENERIC EXAMPLES ---",
-            "User: 'hi' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi! How can I help?\"}}]",
-            "User: 'call me a new name' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"set_preferred_name name=a new name\"}}]",
-            "User: 'remind me to check logs' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"notify\", \"details\": {\"message\": \"Reminder: check logs\"}}}]",
-            "User: 'who are my friends?' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"list_identities\"}}]",
+            "User: 'hello there' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi! How can I help?\"}}]",
+            "User: 'call me a different name' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=a different name\"}}]",
+            "User: 'remind me to check the oven' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"notify\", \"details\": {\"message\": \"Reminder: check the oven\"}}}]",
+            "User: 'who is on my contact list?' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity list\"}}]",
             "--- END EXAMPLES ---",
             "Always respond with a JSON list."
         ]
@@ -1196,6 +1218,7 @@ class CognitionCore:
         ]
 
         if self.persona and hasattr(self.persona, "conv_buffer"):
+             # Get last 3 exchanges (6 messages)
              for interaction in list(self.persona.conv_buffer)[-6:]:
                 messages.append({"role": interaction["role"], "content": interaction["content"]})
 
