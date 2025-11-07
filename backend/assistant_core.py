@@ -184,7 +184,10 @@ def generate_id(prefix: str = "item") -> str:
 class AssistantCore:
     def __init__(self, password: str, storage_path: Optional[str] = None, auto_recover: bool = True):
         self.password = password
-        self.storage_path = storage_path
+        # --- THIS IS THE FIX ---
+        # Ensure self.storage_path is set to the default DB path if not provided
+        self.storage_path = storage_path if storage_path is not None else "assistant_store.db"
+        # --- END FIX ---
         self.auto_recover = auto_recover
 
         # store instance (preferred attribute names used across repo: store and secure_store)
@@ -385,36 +388,41 @@ class AssistantCore:
             logger.debug("AssistantCore: store.close failed (continuing)")
 
         # --- START: CORRECTED FILE DELETION LOGIC ---
-        # Define database names
-        db_names = [
-            self.storage_path or "aaria_secure.db",   # This is the main secure store DB
-            "aaria_memory.db",                        # This is the memory manager DB
-            "assistant_store.db"                      # A common fallback name
+        
+        # Get the real filenames from your provided code
+        # From secure_store.py:
+        DB_PATH = "assistant_store.db"
+        WRAPPED_MASTER_KEY_PATH = "master_key.wrapped"
+        # From memory_manager_sqlite.py:
+        MEMORY_DB_PATH = "aaria_memory.db"
+
+        # Build the final, correct list of files to delete
+        candidates = [
+            WRAPPED_MASTER_KEY_PATH,
+            DB_PATH,
+            f"{DB_PATH}-wal",
+            f"{DB_PATH}-shm",
+            MEMORY_DB_PATH,
+            f"{MEMORY_DB_PATH}-wal",
+            f"{MEMORY_DB_PATH}-shm"
         ]
 
-        # Build list of all candidate files (key + DB files + journals)
-        candidates = ["master_key.wrapped"]
-        for db in db_names:
-            candidates.extend([
-                db,
-                f"{db}-wal",
-                f"{db}-shm"
-            ])
-
-        # --- NEW, FIXED LOOP ---
-        # We must build the full path relative to the backend directory
-        full_path_candidates = [os.path.join(_BACKEND_DIR, fn) for fn in candidates]
-
         removed = 0
-        for fn_path in full_path_candidates: # Iterate over the new list with full paths
+        # The files are in the Current Working Directory (CWD).
+        # We will try to remove them and ignore FileNotFoundError.
+        for fn in candidates: 
             try:
+                # Use os.path.abspath to be 100% sure we are in the CWD
+                fn_path = os.path.abspath(fn)
                 if os.path.exists(fn_path):
                     os.remove(fn_path)
                     removed += 1
-                    logger.info("AssistantCore: removed file %s", fn_path) # Log the full path
-            except Exception:
-                logger.debug("AssistantCore: could not remove %s", fn_path, exc_info=True)
-        # --- END OF FIX ---
+                    logger.info("AssistantCore: removed file %s", fn_path)
+                else:
+                    logger.debug("AssistantCore: candidate file %s not found (skipping)", fn_path)
+            except Exception as e:
+                logger.debug("AssistantCore: could not remove %s: %s", fn_path, e, exc_info=True)
+        # --- END: CORRECTED FILE DELETION LOGIC ---
 
         logger.info("AssistantCore: removed %d candidate files", removed)
 
@@ -424,7 +432,6 @@ class AssistantCore:
             self.store = self._store
             self.secure_store = self._store
 
-            # --- PREVIOUS FIX (STILL REQUIRED) ---
             logger.info("AssistantCore: Re-connecting to new store after recovery...")
             connect_m = getattr(self._store, "connect", None)
             if connect_m:
@@ -433,7 +440,6 @@ class AssistantCore:
                     await res_connect
             else:
                 logger.warning("AssistantCore: Recovered store instance has no connect method.")
-            # --- END PREVIOUS FIX ---
 
             create_m = getattr(self._store, "create_and_store_master_key", None)
             if create_m:

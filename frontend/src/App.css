@@ -1,0 +1,53 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700&display=swap');
+
+@tailwind base; /* KEPT ONE INSTANCE */
+@tailwind components;
+@tailwind utilities;
+
+:root{
+  --holo-bg: #05060a;
+  --panel-border-color: rgba(0,255,255,0.28);
+  --panel-glow-color: rgba(0,170,255,0.18);
+  --text-primary: #dfefff;
+  --text-secondary: rgba(220,230,255,0.6);
+  --glow-primary: rgba(0,170,255,0.18);
+  --glow-secondary: rgba(180,80,255,0.22);
+  --base-bg: rgba(10,10,12,0.6);
+}
+
+/* Custom Scrollbar for a sleek, sci-fi look */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(0, 255, 255, 0.1); /* Subtle cyan track */
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 255, 0.4); /* Cyan thumb */
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 255, 0.7); /* Brighter cyan on hover */
+}
+
+/* Core styling for the holographic panel effect (Problem 4 fix) */
+.holographic-panel {
+  /* Using clip-path for angled corners */
+  clip-path: polygon(
+    2% 0%, 98% 0%, 100% 2%, 100% 98%, 98% 100%, 2% 100%, 0% 98%, 0% 2%
+  );
+  /* Apply a default border and shadow, which can be extended by Tailwind utility classes */
+  border: 1px solid var(--panel-border-color, rgba(0, 255, 255, 0.4)); /* Fallback for custom property */
+  box-shadow: 
+    0 0 15px var(--panel-glow-color, rgba(0, 255, 255, 0.4)), 
+    inset 0 0 8px var(--panel-glow-color, rgba(0, 255, 255, 0.2)),
+    0 0 30px var(--panel-glow-color, rgba(0, 255, 255, 0.1)); /* Deeper outer glow */
+  
+  /* Apply the border pulse animation from tailwind.config.js */
+  animation: border-pulse 4s infinite ease-in-out; 
+}

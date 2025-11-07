@@ -1,0 +1,101 @@
+I need to start building a project from scratch. I am swamped by work all the time and i do not have necessary funds but i'm in need of a personal assistant. So i need to build a digital artificially intelligent assistant that can fulfil all the tasks of a real personal assistant. The main functions would be:
+1. Planning, rearranging and scheduling events on calendar based on priority and deadlines.
+2. Keeping a digital database to store all information on myself and the people i contact with in an encrypted format.
+3. Taking up calls on my secondary sim and conversing and storing the conversations in my absence or when asked to.
+4. Provice quick solutions to problems when asked to.
+5. Have access to my applications on my devices on my explicit instructions.
+6. Run actively 24/7 on my pc and android devices.
+7. Understanding human communications while I converse or while it converses and take down notes.
+8. Actively advise in general without prompt keeping in check and running by things with me.
+
+Don't give me a timeline to finish this project as I'm going to be working day and night to get this task done as soon as possible.
+
+The next step is implementing A.A.R.I.A. correctly. A.A.R.I.A. is going to be uploaded to my social applications, phone-calls and website, and will communicate with me as well as others. However, A.A.R.I.A. is my personal assistant and not others. It is just responding to others on my behalf or disposal. Retrieval of information shall follow the attached flow so we need to implement this flow in A.A.R.I.A. to help it distinguish between me and my conversations with it, which will be completely privileged as it's owner; specific privileged users that I may allow to access certain privileged data (eg; if my mother interacts with A.A.R.I.A., she is allowed to know my current whereabouts); general public that have only access to public data that I Allow explicitly to be shared publicly (eg; if someone like a colleague asks for my company's name and I have been publicly open with it on some social site or say it is public information then A.A.R.I.A is allowed to share it with them but if they ask for my current location, A.A.R.I.A. is not allowed to give it up under any circumstances without EXPLICIT instructions and multiple verifications). Also for me when I access A.A.R.I.A. from remote devices like website or smartphone or anything that is not my home pc, I can access limited root data and not make any changes to A.A.R.I.A. Only from my home pc I have root write access privileges and can make changes.This should also fix the problem of A.A.R.I.A. not recollecting my name everytime the conversation starts. And even from my home terminal or other devices someone else (physical theft, virtual device control, etc.) might gain access so we need to put a strong verification method like voice recognition, facial/retina scan, fingerprint or rotating Authentication keys linked to authenticator app/ physical key when other methods are disabled (during testing). Please suggest your outlook on this situation and any changes/fixes in code needed to achieve this without HARDCODING information.
+
+Flowchart format:
+---
+config:
+  layout: dagre
+---
+flowchart TB
+    n5["Root Database"] --> n6["Owner/Confidential Data"] & n8["Public Data"]
+    n6 --> n7["Access Data"]
+    n1(("A.A.R.I.A")) --> n4["Request Identification"]
+    n4 --> n2["Owner Request"] & n12["Public Request"]
+    n12 --> n9["Secondary Request Identification"]
+    n9 --> n11["Privileged Request"] & n10["General Request"]
+    n2 --> n13["Request Source Identification"]
+    n13 --> n14["Remote Terminal"] & n15["Private Terminal"]
+    n10 --> n8
+    n11 --> n7
+    n15 --> n5
+    n14 --> n6
+    n5@{ shape: db}
+    n6@{ shape: stored-data}
+    n8@{ shape: das}
+    n7@{ shape: stored-data}
+    n4@{ shape: decision}
+    n2@{ shape: proc}
+    n12@{ shape: proc}
+    n9@{ shape: decision}
+    n11@{ shape: proc}
+    n10@{ shape: proc}
+    n13@{ shape: decision}
+    n14@{ shape: proc}
+    n15@{ shape: proc}
+
+The error still persists. I think we should shift our focus to our structure.  As we know that there is a Root Databse containing all the data which further segments and stores data on my discretion. All data regarding me goes to the confidential data that is inaccessible by anyone but me. I may allow certain data to be stored in Access Data, that can be accessed only by privileged users given permission by me. Rest data as you know goes to the Public Database. Another segmentation that should be added is Identity Data, that stores data into unique containers for each identity A.A.R.I.A. interacts with or hears from me (eg: My friend Jhon tries to contact me and A.A.R.I.A. recieves the line; Jhon is angry because there is urgency in his matter, so A.A.R.I.A. assures him that his message will reach me immediately (based on smart classification of his urgency). A.A.R.I.A. further notes down and stores information in Jhon's container that Jhon is usually angry when there's any emergency and he isn't able to reach the person he wants to contact. Further when next time Jhon comes in contact with A.A.R.I.A. upon direct/indirect (verbal, voice, nature of messaging) verification, can better personalize and deal with Jhon ) (eg2: I ask A.A.R.I.A. to remind me about Jhon's birthday in 2 days. A.A.R.I.A. confirms which Jhon and the along with setting a reminder, it will also store the information in Jhon's container about his birthday). Also an important point to handle users with similar name and segment even the user data as to how much A.A.R.I.A. can tell them about themselves (eg: I say Jhon acts like a fool around Daisy). No information should be hardcoded, generated out of thin air or vulnerable to attacks. As I mentioned, inferencing of information is allowed but False memories are intolerable. I get privileged access to all information. We have to implement this architecture 
+
+Now that primary functional model is ready, the next step will be giving A.A.R.I.A. a body; i.e. a software program so that I don't have to open terminal everytime to chat with A.A.R.I.A. This software, apart from containing all the code we have written till now, shall also have exclusive control of the PC it is going to be deployed in. It will treat the PC as it's home, shifting, moving, arranging it as per needed, having read/write permissions, actively be running all the time unless terminated by me, having access to camera, calendar, microphone etc, with a Fool-Proof impenetrable security measures preventing it from being hacked by anyone. We shall move on with the UI/UX design of the software.
+
+Perfect, we move with the Evolving Data Stream Interface designed to feel more organic and flowing. Information isn't just in static panels; it will be presented as data streams that coalesce into interactive modules. The central constantly active and moving holographic element will be an abstract representation of A.A.R.I.A.'s processing status, communication with me, constantly learning and evolving. The panels can "dock" to the sides and expand when needed, displaying granular details, security logs, or predictive insights. The aesthetic is slightly darker, emphasizing glowing lines and data traces. On startup, the central hologram loads, then from the hologram, emerges interactive buttons and (resizable) panels that fly on to the sides and edges giving the hologram it's place. The panels and buttons can be such that they give all relavant information that I might or do need and can also be added or removed by me OR A.A.R.I.A. on our discretion.
+
+List of files as of 11/5/2025 have been uploaded. Frontend and backend are functioning. Upcoming tasks:
+
+1. Major Frontend interface upgrade needed
+
+2. Compile into application (.exe format) for easier access rather than running terminal everytime
+
+3. Connect A.A.R.I.A. to receive calls and respond to messages and calls on other social platforms (WhatsApp, Instagram, LinkedIn etc.)
+
+4. Connect A.A.R.I.A. to it's home PC completely, giving exclusive access over every application with screen detection so it can virtually carry out any command from arranging desktop icons, planning and storing events in cloud synced local calender to independently playing fps shooter games independently.
+
+5. Add TTS for a fluid back and forth HUMAN-Like conversations.
+
+6. Complie everything and deploy in android application format with one central memory synced over all devices
+
+7. Create a personal website and launch A.A.R.I.A. publicly, that will just provide basic introduction to me and deliver me messages from public (NOT SERVING AS PUBLIC's AI ASSISTANT AS A.A.R.I.A. IS EXCLUSIVELY MINE AND MINE ONLY)
+
+
+
+If you need any files, ask for them as I cannot upload all files here together.
+
+Alright, everything checks out, however let's go a bit advanced with our hologram:
+It's a simple plexus with just colour changing effects. What we can do is Make a plexus that represents the interconnectivity, updates and working of all the cores with each other, reading, writing of data by A.A.R.I.A., jobs it performs and it expanding it's intelligence and memory over time. Instead of the entire plexus having changing colour, we can give the aforementioned components ( 5 cores (individually), memory (reading and writing), expansion of intelligence (creation of new nodes and links) ) their own unique colours and each node and link will change it's intesity on it's state integrating our "state colour changing" idea in a new way. This shall eliminate the need of random function and provide useful data from the hologram itself. Also though we have made hologram into a panel, we don't need a title and border around it, but it should be xy resizable via it's edges (no definite 4-sided boundary)
+Let me clarify even more:
+
+We want NODE(S) from cores, memory read/write, understanding, growth, responses, inputs, and any other possible working and interacting component and add new NODES for new actions.
+
+We have to LINK those nodeS among themselves and other components on how they are interlinked and communicate with each other.
+
+This shall make an incredibly COMPLEX and EVER GROWING PLEXUS (NOT TETRAGON)
+
+Cool and dark pallete of colours (Except for RED) will be used for each component and the color remains consistent among the several nodes of a component
+
+Now the activity in the nodes will be represented as follows:
+
+1. Active Node - Flickering glow between the link and the nodes when it is in use
+
+2. Activated Node Transition color - When a new node is created, it is white and it slowly transitions to the color of it's component.
+
+3. Deactivated Node Transition color - When a node is not in use, deleted or deactivated, it transitions from it's component color to black.
+
+4. Failed Node - Color transitions from component to bright red when a node fails or shows errors.
+
+5. Interconnected Nodes- The link between two nodes from different component will have a transitioning gradient color from one node to other based on their respective colors.
+
+
+
+Each node and link has it's own glow and they are very small (dot like) but several in quantity.
+
+module is imported but not used, if it is to be used, use it or else remove it.
