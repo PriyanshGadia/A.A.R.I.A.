@@ -17,6 +17,9 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
+# Get the directory where this file (assistant_core.py) is located
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+
 logger = logging.getLogger("AARIA.AssistantCore")
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
@@ -202,7 +205,10 @@ class AssistantCore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    # initialization
+    #
+    # Replace the entire 'initialize' function in assistant_core.py
+    # with this new version.
+    #
     async def initialize(self) -> bool:
         if self._is_initialized:
             return True
@@ -219,7 +225,7 @@ class AssistantCore:
             logger.exception("AssistantCore: store.connect failed: %s", e)
             raise
 
-        # master key handling
+        # master key handling AND initial data read
         try:
             has_master = False
             # prefer sync quick check
@@ -273,35 +279,58 @@ class AssistantCore:
                         # try again if sync/async mismatch
                         raise
 
+            # --- MOVED UP & INSIDE TRY BLOCK ---
+            # ensure default user profile exists (this also tests data decryption)
+            profile = await self.load_user_profile()
+            if not profile:
+                # create but prefer store.put(key, type_, payload) when available
+                try:
+                    put_m = getattr(self._store, "put", None)
+                    if put_m:
+                        res = put_m("user_profile", "user_profile_data", self._default_profile)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    else:
+                        put_sync = getattr(self._store, "put_sync", None)
+                        if put_sync:
+                            put_sync("user_profile", "user_profile_data", self._default_profile)
+                except Exception:
+                    logger.exception("AssistantCore: failed to persist default profile")
+
+                logger.info("AssistantCore: default profile saved")
+            # --- END MOVED BLOCK ---
+
         except Exception as e:
-            logger.exception("AssistantCore: master key handling failed: %s", e)
-            if "incorrect" in str(e).lower() or "decryption" in str(e).lower():
+            logger.exception("AssistantCore: master key or data handling failed: %s", e)
+            # Catch both key AND data decryption errors
+            if "incorrect" in str(e).lower() or "decryption" in str(e).lower() or "invalidtag" in str(e).lower():
                 if self.auto_recover:
                     logger.warning("AssistantCore: encryption mismatch detected — attempting recovery.")
-                    await self._recover_from_corruption()
+                    await self._recover_from_corruption() # This function now contains the .connect() fix
+
+                    # --- ADDED BLOCK ---
+                    # After recovery, we MUST re-run the profile creation
+                    logger.info("AssistantCore: Re-creating default profile after recovery.")
+                    try:
+                        put_m = getattr(self._store, "put", None)
+                        if put_m:
+                            res = put_m("user_profile", "user_profile_data", self._default_profile)
+                            if asyncio.iscoroutine(res):
+                                await res
+                        else:
+                            put_sync = getattr(self._store, "put_sync", None)
+                            if put_sync:
+                                put_sync("user_profile", "user_profile_data", self._default_profile)
+                        logger.info("AssistantCore: default profile saved after recovery")
+                    except Exception as e_post_recover:
+                        logger.error("AssistantCore: failed to persist default profile AFTER recovery: %s", e_post_recover)
+                        raise RuntimeError("Failed to create profile after recovery") from e_post_recover
+                    # --- END ADDED BLOCK ---
+
                 else:
                     raise RuntimeError("Encryption key mismatch and auto_recover disabled") from e
             else:
                 raise
-
-        # ensure default user profile exists
-        profile = await self.load_user_profile()
-        if not profile:
-            # create but prefer store.put(key, type_, payload) when available
-            try:
-                put_m = getattr(self._store, "put", None)
-                if put_m:
-                    res = put_m("user_profile", "user_profile_data", self._default_profile)
-                    if asyncio.iscoroutine(res):
-                        await res
-                else:
-                    put_sync = getattr(self._store, "put_sync", None)
-                    if put_sync:
-                        put_sync("user_profile", "user_profile_data", self._default_profile)
-            except Exception:
-                logger.exception("AssistantCore: failed to persist default profile")
-
-            logger.info("AssistantCore: default profile saved")
 
         self._is_initialized = True
         logger.info("AssistantCore: initialization complete")
@@ -355,22 +384,37 @@ class AssistantCore:
         except Exception:
             logger.debug("AssistantCore: store.close failed (continuing)")
 
-        # remove a few candidate files (best-effort)
-        candidates = [
-            self.storage_path or "assistant_store.db",
-            f"{self.storage_path or 'assistant_store.db'}-wal",
-            f"{self.storage_path or 'assistant_store.db'}-shm",
-            "master_key.wrapped",
+        # --- START: CORRECTED FILE DELETION LOGIC ---
+        # Define database names
+        db_names = [
+            self.storage_path or "aaria_secure.db",   # This is the main secure store DB
+            "aaria_memory.db",                        # This is the memory manager DB
+            "assistant_store.db"                      # A common fallback name
         ]
+
+        # Build list of all candidate files (key + DB files + journals)
+        candidates = ["master_key.wrapped"]
+        for db in db_names:
+            candidates.extend([
+                db,
+                f"{db}-wal",
+                f"{db}-shm"
+            ])
+
+        # --- NEW, FIXED LOOP ---
+        # We must build the full path relative to the backend directory
+        full_path_candidates = [os.path.join(_BACKEND_DIR, fn) for fn in candidates]
+
         removed = 0
-        for fn in candidates:
+        for fn_path in full_path_candidates: # Iterate over the new list with full paths
             try:
-                if os.path.exists(fn):
-                    os.remove(fn)
+                if os.path.exists(fn_path):
+                    os.remove(fn_path)
                     removed += 1
-                    logger.info("AssistantCore: removed file %s", fn)
+                    logger.info("AssistantCore: removed file %s", fn_path) # Log the full path
             except Exception:
-                logger.debug("AssistantCore: could not remove %s", fn, exc_info=True)
+                logger.debug("AssistantCore: could not remove %s", fn_path, exc_info=True)
+        # --- END OF FIX ---
 
         logger.info("AssistantCore: removed %d candidate files", removed)
 
@@ -379,6 +423,18 @@ class AssistantCore:
             self._store = _make_store_instance(self.storage_path)
             self.store = self._store
             self.secure_store = self._store
+
+            # --- PREVIOUS FIX (STILL REQUIRED) ---
+            logger.info("AssistantCore: Re-connecting to new store after recovery...")
+            connect_m = getattr(self._store, "connect", None)
+            if connect_m:
+                res_connect = connect_m()
+                if asyncio.iscoroutine(res_connect):
+                    await res_connect
+            else:
+                logger.warning("AssistantCore: Recovered store instance has no connect method.")
+            # --- END PREVIOUS FIX ---
+
             create_m = getattr(self._store, "create_and_store_master_key", None)
             if create_m:
                 res = create_m(self.password)
