@@ -264,13 +264,16 @@ class RateLimiter:
 class CognitionCore:
     # --- [NEW] TOOL MANIFEST ---
     # This defines the "Tools" the agent can use.
+    # --- [UPGRADED] TOOL MANIFEST ---
+    # This version has the CORRECT, SIMPLE commands that
+    # your SecurityOrchestrator and IdentityManager are built to understand.
     TOOL_MANIFEST = [
         {
             "tool_name": "security_command",
             "description": (
                 "Manages user identity, access control, and permissions for all users (Owner and third-parties). "
                 "Use this for: creating new users (e.g., 'I'm Jake'), setting/changing a user's preferred name (e.g., 'call me Skye'), "
-                "adding/removing privileged users, or listing users/devices."
+                "adding/removing privileged users (e.g., 'my friend Jake...'), or listing users/devices."
             ),
             "parameters": {
                 "type": "object",
@@ -278,11 +281,11 @@ class CognitionCore:
                     "command": {
                         "type": "string",
                         "description": (
-                            "The full, explicit, CLI-style security command string based on the user's natural language. "
+                            "The full, explicit, CLI-style security command string. "
                             "Examples: "
-                            "'identity set_preferred_name name=Skye' (for 'call me Skye'), "
-                            "'access add_privileged_user name=Jake relationship=friend privileges=location_updates' (for 'This is my friend Jake'), "
-                            "'identity list'"
+                            "'set_preferred_name name=Skye', "
+                            "'add_privileged_user name=Jake relationship=friend', "
+                            "'list_identities'"
                         )
                     }
                 },
@@ -307,7 +310,6 @@ class CognitionCore:
                         "description": (
                             "A JSON object of parameters for the action. "
                             "Example for calendar: {'title': 'Yash Birthday', 'datetime': '2025-12-12T09:00:00'} "
-                            "Example for notification: {'channel': 'push', 'message': 'Reminder: Yash Bday!'}"
                         )
                     }
                 },
@@ -517,7 +519,7 @@ class CognitionCore:
                      reasoning_mode: ReasoningMode = ReasoningMode.BALANCED,
                      use_llm: bool = True, max_retries: int = 2) -> List[Dict[str, Any]]:
         """
-        [UPGRADED - v5]
+        [UPGRADED - v4]
         This version now robustly finds the JSON block
         even if the LLM adds conversational text.
         """
@@ -588,7 +590,6 @@ class CognitionCore:
                     plan = []
                     try:
                         # Find the first JSON list or object
-                        # This regex finds the first '[' or '{' and matches until the last ']' or '}'
                         json_match = re.search(r'\[.*\]|\{.*\}', raw_response, re.DOTALL)
                         
                         if json_match:
@@ -1156,9 +1157,9 @@ class CognitionCore:
     # --- [END REPLACED] ---
     def _build_enhanced_prompt(self, query: str, context: Dict[str, Any], reasoning_mode: ReasoningMode) -> List[Dict[str, str]]:
         """
-        [UPGRADED - v2]
-        This prompt is now *stricter* to force the LLM to choose
-        the correct tool instead of just chatting.
+        [UPGRADED - v3]
+        This prompt is now *stricter* and removes hard-coded user examples.
+        It uses generic examples to guide the LLM.
         """
         ev: EmotionalVector = self.cognitive_state["emotional_vector"]
         
@@ -1167,7 +1168,8 @@ class CognitionCore:
             base_system_prompt = self.persona.system_prompt
         
         # --- [CRITICAL PROMPT FIX] ---
-        # Instructions are now more direct and forceful.
+        # Instructions are now more direct and force JSON.
+        # Hardcoded user-specific examples are REMOVED.
         system_parts = [
             base_system_prompt, # This includes the personality, user name, date, etc.
             "\n--- AGENTIC INSTRUCTIONS ---",
@@ -1179,10 +1181,11 @@ class CognitionCore:
             json.dumps(self.TOOL_MANIFEST, indent=2),
             "--- TOOL MANIFEST END ---",
             f"Current Emotional Context: Calm {ev.calm:.2f}, Alert {ev.alert:.2f}, Stress {ev.stress:.2f}",
-            "--- EXAMPLES ---",
-            "User: 'hi' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi there! What can I help you with?\"}}]",
-            "User: 'call me Master' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=Master\"}}]",
+            "--- GENERIC EXAMPLES ---",
+            "User: 'hi' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi! How can I help?\"}}]",
+            "User: 'call me a new name' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"set_preferred_name name=a new name\"}}]",
             "User: 'remind me to check logs' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"notify\", \"details\": {\"message\": \"Reminder: check logs\"}}}]",
+            "User: 'who are my friends?' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"list_identities\"}}]",
             "--- END EXAMPLES ---",
             "Always respond with a JSON list."
         ]
@@ -1190,7 +1193,6 @@ class CognitionCore:
 
         messages = [
             {"role": "system", "content": "\n".join(system_parts)},
-            {"role": "user", "content": query}
         ]
 
         if self.persona and hasattr(self.persona, "conv_buffer"):
