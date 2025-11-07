@@ -8,6 +8,8 @@ import traceback
 import asyncio
 import inspect
 import time
+from zoneinfo import ZoneInfo
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 # Optional third-party helpers
@@ -70,6 +72,11 @@ except Exception:
     InteractionCore = None
     InboundMessage = None
     create_interaction_core = None
+
+try:
+    from memory_manager import MemoryManager
+except Exception:
+    MemoryManager = None
 
 # Security related (optional)
 try:
@@ -348,12 +355,25 @@ class AARIASystem:
                 except Exception:
                     self.logger.debug("Hologram base init failed (non-fatal)", exc_info=True)
 
+            # Memory Manager (The Root Database)
+            self.logger.info("Initializing Memory Manager...")
+            memory_manager = MemoryManager(assistant_core=assistant)
+            self.components["memory_manager"] = memory_manager
+            # Inject into assistant for other modules to find
+            assistant.memory_manager = memory_manager
+
             # Persona core
             if PersonaCore is None:
                 self.logger.error("PersonaCore missing — cannot continue safely.")
                 return False
             self.logger.info("Initializing Persona Core...")
             persona = PersonaCore(core=assistant)
+            
+            # --- THIS IS THE FIX ---
+            # Inject the MemoryManager as the source of truth
+            persona.memory_manager = memory_manager
+            # --- END FIX ---
+            
             init_m = getattr(persona, "initialize", None)
             if inspect.iscoroutinefunction(init_m):
                 await init_m()

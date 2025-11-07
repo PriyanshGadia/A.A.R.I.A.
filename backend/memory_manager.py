@@ -105,6 +105,12 @@ class MemoryManager:
 
     def _audit_key(self) -> str:
         return self._root_key(AUDIT_NAMESPACE)
+    
+    def _transcript_index_key(self, identity_id: str) -> str:
+        return self._root_key("transcript_index", identity_id)
+
+    def _semantic_index_key(self, identity_id: str) -> str:
+        return self._root_key("semantic_index", identity_id)
 
     # -----------------------
     # Low-level store helpers (robust)
@@ -862,6 +868,45 @@ class MemoryManager:
                     if len(found) >= limit:
                         return found
         return found
+    
+    async def append_transcript(self, identity_id: str, transcript_entry: Dict[str, Any]) -> str:
+        """
+        Appends a raw transcript entry to the identity's transcript store.
+        """
+        key = self._transcript_index_key(identity_id)
+        entry_id = transcript_entry.get("id", f"tx_{uuid.uuid4().hex[:8]}")
+        transcript_entry["id"] = entry_id
+        
+        async with self._locks["store"]:
+            # We store transcripts as a simple list in a single key per identity
+            transcripts = await self._store_get(key) or []
+            transcripts.append(transcript_entry)
+            # Bound the list to prevent infinite growth
+            if len(transcripts) > self.max_per_identity:
+                transcripts = transcripts[-self.max_per_identity:]
+            await self._store_put(key, transcripts)
+            
+        await self._audit("persona", "transcript_append", entry_id, {"subject": identity_id})
+        return entry_id
+
+    async def append_semantic_entry(self, identity_id: str, semantic_entry: Dict[str, Any]) -> str:
+        """
+        Appends a compact semantic entry to the identity's semantic index.
+        """
+        key = self._semantic_index_key(identity_id)
+        entry_id = semantic_entry.get("id", f"sem_{uuid.uuid4().hex[:8]}")
+        semantic_entry["id"] = entry_id
+        
+        async with self._locks["store"]:
+            # Semantic index is also a list per identity
+            index = await self._store_get(key) or []
+            index.append(semantic_entry)
+            if len(index) > self.max_per_identity:
+                index = index[-self.max_per_identity:]
+            await self._store_put(key, index)
+            
+        await self._audit("persona", "semantic_append", entry_id, {"subject": identity_id})
+        return entry_id
 
     # -----------------------
     # Back-compat convenience wrappers

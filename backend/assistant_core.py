@@ -13,6 +13,7 @@ import os
 import asyncio
 import logging
 import time
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
@@ -170,9 +171,15 @@ def _make_store_instance(storage_path: Optional[str] = None):
 # ---------------------------
 # Utilities
 # ---------------------------
+# --- FIX: Changed to IST ---
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
+    try:
+        IST = ZoneInfo("Asia/Kolkata")
+    except Exception:
+        # Fallback if zoneinfo fails
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(IST).isoformat()
+# --- END FIX ---
 def generate_id(prefix: str = "item") -> str:
     ts = int(datetime.now(timezone.utc).timestamp() * 1000)
     return f"{prefix}_{ts}_{uuid4().hex[:8]}"
@@ -184,21 +191,22 @@ def generate_id(prefix: str = "item") -> str:
 class AssistantCore:
     def __init__(self, password: str, storage_path: Optional[str] = None, auto_recover: bool = True):
         self.password = password
-        # --- THIS IS THE FIX ---
-        # Ensure self.storage_path is set to the default DB path if not provided
-        self.storage_path = storage_path if storage_path is not None else "assistant_store.db"
+        # --- FIX: Ensure storage_path defaults to DB_PATH ---
+        from secure_store import DB_PATH as DEFAULT_DB_PATH
+        self.storage_path = storage_path if storage_path is not None else DEFAULT_DB_PATH
         # --- END FIX ---
         self.auto_recover = auto_recover
 
         # store instance (preferred attribute names used across repo: store and secure_store)
-        self._store = _make_store_instance(storage_path)
+        self._store = _make_store_instance(self.storage_path)
         # expose both names
         self.store = self._store
         self.secure_store = self._store
 
         self._is_initialized = False
-        # default (small) user profile
-        self._default_profile = {"name": "Owner", "timezone": "UTC", "created": _now_iso()}
+        # --- FIX: Default profile timezone changed to IST ---
+        self._default_profile = {"name": "Owner", "timezone": "IST", "created": _now_iso()}
+        # --- END FIX ---
 
     # context manager
     async def __aenter__(self):
