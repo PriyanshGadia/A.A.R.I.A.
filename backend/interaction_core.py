@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 """
-A.A.R.I.A Interaction Layer (Async Production v2.0.3) - Full replacement.
+A.A.R.I.A Interaction Layer (Async Production v3.0.0 - Agentic Router)
 
-Usage:
-    interaction = await create_interaction_core(persona, cognition, autonomy, config)
-    await interaction.start()
-    ...
-    await interaction.stop()
+This core is now the "Hands" of the agent. It does not contain any
+intelligence or parsing logic. It does the following:
+1. Identifies the user via SecurityOrchestrator.
+2. Manages the session.
+3. Asks CognitionCore (the "Brain") for a plan.
+4. Executes the plan (calling other cores as tools).
+5. Sends the final result to the user.
 """
 
 import asyncio
@@ -25,10 +27,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from contextlib import suppress
+
+# --- [NEW] IMPORTS FOR AGENTIC ROUTER ---
+# These are required for the new executor logic and its fallbacks
 from access_control import SecurityContext, RequestSource, UserIdentity, AccessLevel
 from identity_manager import IdentityProfile
 from autonomy_core import Action, ActionPriority
 from cognition_core import ReasoningMode
+# --- [END NEW IMPORTS] ---
+
 # Optional holo state
 try:
     import hologram_state  # optional telemetry/holo integration
@@ -57,58 +64,7 @@ if PROMETHEUS_AVAILABLE:
 else:
     metrics = None
 
-# ---------- Minimal security/identity stubs (used if real modules missing) ----------
-try:
-    from access_control import AccessLevel, RequestSource, UserIdentity  # type: ignore
-    from identity_manager import IdentityProfile, IdentityState, VerificationMethod  # type: ignore
-except Exception:
-    class AccessLevel:
-        OWNER_ROOT = "owner_root"
-        OWNER_REMOTE = "owner_remote"
-        PRIVILEGED = "privileged"
-        PUBLIC = "public"
-
-    class RequestSource:
-        PRIVATE_TERMINAL = "private_terminal"
-        REMOTE_TERMINAL = "remote_terminal"
-        SOCIAL_APP = "social_app"
-        PHONE_CALL = "phone_call"
-        PUBLIC_API = "public_api"
-
-    class IdentityProfile:
-        def __init__(self, identity_id="", name="", preferred_name="", verification_methods=None,
-                     identity_state=None, last_verified=0, verification_expires=0, relationship="public"):
-            self.identity_id = identity_id
-            self.name = name
-            self.preferred_name = preferred_name
-            self.verification_methods = verification_methods or set()
-            self.identity_state = identity_state
-            self.last_verified = last_verified
-            self.verification_expires = verification_expires
-            self.relationship = relationship
-
-    class IdentityState:
-        UNVERIFIED = "unverified"
-        VERIFIED_TEMPORARY = "verified_temporary"
-        VERIFIED_EXTENDED = "verified_extended"
-        VERIFIED_TRUSTED = "verified_trusted"
-
-    class VerificationMethod:
-        BIOMETRIC_FACIAL = "biometric_facial"
-        TOTP_AUTHENTICATOR = "totp_authenticator"
-        HARDWARE_TOKEN = "hardware_token"
-
-    class UserIdentity:
-        def __init__(self, user_id="", name="", preferred_name="", access_level=None,
-                     privileges=None, verification_required=False):
-            self.user_id = user_id
-            self.name = name
-            self.preferred_name = preferred_name
-            self.access_level = access_level or AccessLevel.PUBLIC
-            self.privileges = privileges or set()
-            self.verification_required = verification_required
-
-# ---------- Optional component type placeholders ----------
+# ---------- Component type placeholders (remains the same) ----------
 try:
     from persona_core import PersonaCore  # type: ignore
 except Exception:
@@ -124,7 +80,7 @@ try:
 except Exception:
     AutonomyCore = None  # type: ignore
 
-# ---------- Dataclasses ----------
+# ---------- Dataclasses (remains the same) ----------
 @dataclass
 class Session:
     session_id: str
@@ -170,19 +126,18 @@ class InteractionCore:
         "response_cache_ttl": 300,
         "audit_event_key": "cognition_audit",
         "autosave_interval": 60,
-        "max_llm_retries": 3,
-        "llm_backoff_base": 0.5,
+        # "max_llm_retries": 3, # <-- Obsolete, moved to CognitionCore/LLMAdapter
+        # "llm_backoff_base": 0.5, # <-- Obsolete
         "hmac_audit_key": None,
         "rate_limiter_mode": "sliding",
         "token_bucket_capacity": 60,
         "token_bucket_refill_rate_per_minute": 60,
-        "primary_provider": "groq",
+        # "primary_provider": "groq", # <-- Obsolete, moved to LLMAdapter
         "proactive_poll_interval": 1.0,
         "proactive_persist_key": "interaction_proactive_queue_v1",
         "session_persist_key": "interaction_sessions_v1",
         "proactive_retry_base": 3.0,
         "proactive_max_attempts": 5,
-        # opt-in: don't proactively enable for everyone unless explicitly allowed
         "allow_proactive_by_default": False,
     }
 
@@ -193,7 +148,7 @@ class InteractionCore:
         self.autonomy = autonomy
         self.config = {**self.DEFAULT_CONFIG, **(config or {})}
 
-        # security orchestrator (optionally provided by config or persona.core)
+        # security orchestrator
         try:
             self.security_orchestrator = self.config.get("security_orchestrator") or (getattr(self.persona, "core", None) and getattr(self.persona.core, "security_orchestrator", None))
         except Exception:
@@ -219,19 +174,10 @@ class InteractionCore:
         self._user_rate_windows: Dict[str, deque] = {}
         self._token_buckets: Dict[str, Dict[str, float]] = {}
 
-        # intent patterns
-        self.intent_patterns = {
-            "greeting": re.compile(r"\b(hi|hello|hey|good (morning|afternoon|evening))\b", re.I),
-            "thanks": re.compile(r"\b(thanks|thank you|thx)\b", re.I),
-            "help": re.compile(r"\b(help|assist|support|what can you)\b", re.I),
-            "schedule": re.compile(r"\b(schedule|resched|calendar|meeting|appointment)\b", re.I),
-            "contact": re.compile(r"\b(call|phone|contact|email)\b", re.I),
-            "command": re.compile(r"^(?:run|execute|do)\b", re.I),
-            "query": re.compile(r"\b(who|what|when|where|why|how)\b", re.I),
-        }
-
-        # privileged actions detection
-        self.privileged_actions = [re.compile(p, re.I) for p in [r"autonomy\.execute", r"system\.shutdown", r"calendar\.add"]]
+        # --- [DELETED] ---
+        # self.intent_patterns = { ... }
+        # self.privileged_actions = [ ... ]
+        # --- [END DELETED] ---
 
         # audit logger (optional)
         self.audit_logger = None
@@ -258,26 +204,20 @@ class InteractionCore:
 
         logger.info("InteractionCore instance constructed (call await start() to run background workers)")
 
-    # ---------------- Lifecycle ----------------
+    # ---------------- Lifecycle (remains the same) ----------------
     async def start(self):
         """Start background workers and load persisted state. Caller must await this."""
         if self._background_tasks:
             logger.debug("InteractionCore already started")
             return
-
-        # load persisted sessions/proactive queue from store if available
         await self._load_persisted_sessions()
         await self._load_persisted_proactive_queue()
-
-        # spawn workers
         autosave_interval = float(self.config.get("autosave_interval", 60))
         poll_interval = float(self.config.get("proactive_poll_interval", 1.0))
-
         self._stop_event.clear()
         self._background_tasks.append(asyncio.create_task(self._autosave_worker(autosave_interval)))
         self._background_tasks.append(asyncio.create_task(self._outbound_worker()))
         self._background_tasks.append(asyncio.create_task(self._proactive_worker(poll_interval)))
-
         logger.info("Async InteractionCore started with %d background tasks", len(self._background_tasks))
 
     async def stop(self, wait_seconds: float = 5.0):
@@ -293,7 +233,6 @@ class InteractionCore:
             except Exception:
                 pass
         self._background_tasks.clear()
-        # persist state synchronously on stop
         await self._persist_sessions(force=True)
         await self._persist_proactive_queue(force=True)
         logger.info("InteractionCore stopped")
@@ -305,7 +244,7 @@ class InteractionCore:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.stop()
 
-    # ---------------- Core helpers ----------------
+    # ---------------- Core helpers (remains the same) ----------------
     def _get_core(self) -> Optional[Any]:
         """Try to find a core-like object with .store / .notify to integrate with."""
         for comp in (self.persona, self.cognition, self.autonomy):
@@ -314,7 +253,6 @@ class InteractionCore:
                     return comp.core
             except Exception:
                 continue
-        # direct persona-like object fallback
         for comp in (self.persona, self.cognition, self.autonomy):
             try:
                 if comp and (hasattr(comp, "save_user_profile") or hasattr(comp, "store")):
@@ -323,7 +261,7 @@ class InteractionCore:
                 continue
         return None
 
-    # ---------------- Persistence: sessions ----------------
+    # ---------------- Persistence: sessions (remains the same) ----------------
     async def _load_persisted_sessions(self):
         core = self._get_core()
         key = self.config.get("session_persist_key", "interaction_sessions_v1")
@@ -385,7 +323,6 @@ class InteractionCore:
             for sid, sess in list(self.sessions.items()):
                 if sess.is_expired():
                     continue
-                # sanitize history for JSON
                 clean_history = []
                 for h in list(sess.history):
                     try:
@@ -416,7 +353,7 @@ class InteractionCore:
         except Exception as e:
             logger.warning("Failed to persist sessions: %s", e, exc_info=True)
 
-    # ---------------- Session APIs ----------------
+    # ---------------- Session APIs (remains the same) ----------------
     async def create_session(self, user_id: Optional[str] = None, persona_tone: str = "default", ttl_seconds: Optional[int] = None) -> Session:
         sid = f"sess_{uuid.uuid4().hex[:12]}"
         ttl = int(ttl_seconds if ttl_seconds is not None else self.config.get("session_ttl", 3600))
@@ -463,7 +400,7 @@ class InteractionCore:
         logger.debug("Cleaned up %d expired sessions", removed)
         return removed
 
-    # ---------------- Dedup / Rate limit ----------------
+    # ---------------- Dedup / Rate limit (remains the same) ----------------
     def _hash_request(self, inbound: InboundMessage) -> str:
         key = f"{inbound.user_id}|{inbound.channel}|{inbound.content}"
         return hashlib.sha256(key.encode()).hexdigest()
@@ -528,105 +465,17 @@ class InteractionCore:
             bucket["tokens"] -= 1.0
         return True, None
 
-    # ---------------- Intent & Privilege Helpers ----------------
-    def classify_intent(self, message: str) -> str:
-        text = message.strip()
-        for intent, pattern in self.intent_patterns.items():
-            if pattern.search(text):
-                return intent
-        if text.endswith("?"):
-            return "query"
-        return "utterance"
+    # ---------------- Intent & Privilege Helpers (DELETED) ----------------
+    # def classify_intent(self, message: str) -> str: ...
+    # def _contains_privileged_action(self, content: str) -> bool: ...
+    # async def is_privileged(self, ...) -> bool: ...
 
-    def _contains_privileged_action(self, content: str) -> bool:
-        for p in self.privileged_actions:
-            if p.search(content):
-                return True
-        return False
+    # ---------------- LLM helper (DELETED) ----------------
+    # async def _call_llm_with_retries(self, ...) -> str: ...
 
-    async def is_privileged(self, parsed_intent: str, user_id: Optional[str], session: Optional[Session]) -> bool:
-        if not session or not session.user_id:
-            return False
-        try:
-            profile = {}
-            if hasattr(self.persona, "core") and hasattr(self.persona.core, "load_user_profile"):
-                profile = await self.persona.core.load_user_profile() or {}
-            is_admin = profile.get("is_admin", False) or profile.get("user_id") == session.user_id
-            return bool(is_admin)
-        except Exception:
-            return False
-
-    # ---------------- LLM helper (fallback to cognition) ----------------
-    async def _call_llm_with_retries(self, messages: List[Dict[str, str]], model: Optional[str] = None, temperature: float = 0.2, max_tokens: int = 400) -> str:
-        try:
-            from llm_adapter import LLMAdapterFactory, LLMProvider, LLMRequest  # type: ignore
-        except Exception:
-            # fallback to cognition.reason if available
-            if hasattr(self.cognition, "reason"):
-                try:
-                    plaintext = "\n".join([m.get("content", "") for m in messages])
-                    return await self.cognition.reason(plaintext, context={})
-                except Exception:
-                    pass
-            return "[LLM unavailable]"
-
-        max_retries = int(self.config.get("max_llm_retries", 3))
-        backoff_base = float(self.config.get("llm_backoff_base", 0.5))
-        primary_provider = self.config.get("primary_provider", "groq")
-        providers = [LLMProvider.GROQ, LLMProvider.OLLAMA] if primary_provider == "groq" else [LLMProvider.OLLAMA, LLMProvider.GROQ]
-        last_exc = None
-
-        for provider in providers:
-            attempt = 0
-            while attempt <= max_retries:
-                try:
-                    async with LLMAdapterFactory.get_adapter(provider) as adapter:
-                        request = LLMRequest(messages=messages, temperature=temperature, max_tokens=max_tokens)
-                        response = await adapter.chat(request)
-                        if response and getattr(response, "content", None):
-                            return response.content.strip()
-                        break
-                except Exception as e:
-                    last_exc = e
-                    attempt += 1
-                    if attempt > max_retries:
-                        break
-                    jitter = (time.time() % 0.1)
-                    sleep_for = (backoff_base * (2 ** (attempt - 1))) + jitter
-                    logger.warning("LLM call failed (%s attempt %d/%d): %s — backing off %.2fs", getattr(provider, "value", str(provider)), attempt, max_retries, e, sleep_for)
-                    await asyncio.sleep(sleep_for)
-
-        # final fallback
-        if hasattr(self.cognition, "reason"):
-            try:
-                plaintext = "\n".join([m.get("content", "") for m in messages])
-                return await self.cognition.reason(plaintext, context={})
-            except Exception:
-                pass
-        logger.error("LLM calls exhausted: last_exc=%s", last_exc)
-        return "[Service temporarily unavailable - please try again later]"
-
-    # ---------------- Persona prompt & caching ----------------
-    async def _build_persona_prompt(self, user_input: str, session: Optional[Session]) -> List[Dict[str, str]]:
-        persona_meta = getattr(self.persona, "system_prompt", "You are A.A.R.I.A.")
-        user_meta = {}
-        try:
-            if hasattr(self.persona, "core") and hasattr(self.persona.core, "load_user_profile"):
-                profile = await self.persona.core.load_user_profile() or {}
-                user_meta = {"name": profile.get("name", "User"), "timezone": profile.get("timezone", "UTC")}
-        except Exception:
-            user_meta = {"name": "User"}
-        emotive_hint = session.metadata.get("emotion") if session else None
-        system_block = f"{persona_meta}\nTone: {session.persona_tone if session else 'default'}\nUserMeta: {json.dumps(user_meta)}\nEmotionHint: {emotive_hint or 'neutral'}"
-        messages = [{"role": "system", "content": system_block}, {"role": "user", "content": user_input}]
-        if session and session.history:
-            for turn in list(session.history)[-8:]:
-                if isinstance(turn, dict):
-                    role = turn.get("role", "user")
-                    content = turn.get("content", "")
-                    messages.append({"role": role, "content": content})
-        return messages
-
+    # ---------------- Persona prompt & caching (caching remains) ----------------
+    # async def _build_persona_prompt(self, ...) -> List[Dict[str, str]]: ...
+    
     def _cache_response(self, request_hash: str, response: str):
         expiry = time.time() + int(self.config.get("response_cache_ttl", 300))
         self._response_cache[request_hash] = (expiry, response)
@@ -641,7 +490,7 @@ class InteractionCore:
             return None
         return response
 
-    # ---------------- Audit ----------------
+    # ---------------- Audit (remains the same) ----------------
     def _sign_audit_payload(self, payload: Dict[str, Any]) -> Optional[str]:
         key_b64 = self.config.get("hmac_audit_key")
         if not key_b64:
@@ -745,67 +594,10 @@ class InteractionCore:
             logger.warning("Audit failed unexpectedly: %s", e, exc_info=True)
             return None
 
-    # ---------------- Security quick path ----------------
-    async def _process_security_commands_directly(self, inbound: InboundMessage) -> Optional[OutboundMessage]:
-        content_low = (inbound.content or "").strip().lower()
-        security_patterns = [r"^security\s+", r"^access\s+", r"^identity\s+", r"^set_name\s+"]
-        if not any(re.match(p, content_low) for p in security_patterns):
-            return None
-        if not self.security_orchestrator:
-            return OutboundMessage(channel=inbound.channel, content="Security subsystem unavailable.", user_id=inbound.user_id, session_id=inbound.session_id)
-        try:
-            request_payload = {
-                "query": inbound.content,
-                "user_id": inbound.user_id,
-                "device_id": inbound.metadata.get("device_id", "cli_terminal"),
-                "source": inbound.metadata.get("source", "private_terminal"),
-                "user_name": inbound.metadata.get("user_name")
-            }
-            if hasattr(self.security_orchestrator, "process_security_flow_enhanced"):
-                res = await self.security_orchestrator.process_security_flow_enhanced(request_payload)
-            elif hasattr(self.security_orchestrator, "process_security_flow"):
-                res = await self.security_orchestrator.process_security_flow(request_payload)
-            else:
-                res = (None, None)
-            security_context = None
-            identity_profile = None
-            if isinstance(res, tuple) and len(res) >= 2:
-                security_context, identity_profile = res[0], res[1]
-            else:
-                security_context = getattr(res, "security_context", None)
-                identity_profile = getattr(res, "identity_profile", None)
+    # ---------------- Security quick path (DELETED) ----------------
+    # async def _process_security_commands_directly(self, ...) -> Optional[OutboundMessage]: ...
 
-            if content_low.startswith("set_name "):
-                new_name = inbound.content[len("set_name "):].strip()
-                return await self._handle_set_name_directly(new_name, identity_profile or IdentityProfile(), inbound)
-
-            if content_low.startswith("security ") and content_low.split()[1:2] and content_low.split()[1] == "status":
-                try:
-                    if hasattr(self.security_orchestrator, "get_security_status"):
-                        status = await self.security_orchestrator.get_security_status()
-                        resp_text = f"🛡️ Security Status: {status.get('overall_status','unknown')}\n"
-                        ac = status.get("access_control", {})
-                        im = status.get("identity_management", {})
-                        resp_text += f"  • Privileged users: {ac.get('privileged_users_count','?')}, Trusted devices: {ac.get('trusted_devices_count','?')}\n"
-                        resp_text += f"  • Known identities: {im.get('known_identities','?')}, Active sessions: {im.get('active_sessions','?')}"
-                        return OutboundMessage(channel=inbound.channel, content=resp_text, user_id=inbound.user_id, session_id=inbound.session_id)
-                except Exception:
-                    pass
-
-            if content_low.startswith("access "):
-                command = inbound.content[len("access "):].strip()
-                return await self._process_access_command(command, identity_profile or IdentityProfile(), inbound)
-            if content_low.startswith("identity "):
-                command = inbound.content[len("identity "):].strip()
-                return await self._process_identity_command(command, identity_profile or IdentityProfile(), inbound)
-
-            return OutboundMessage(channel=inbound.channel, content=f"Unknown security command: {inbound.content}", user_id=inbound.user_id, session_id=inbound.session_id)
-        except Exception as e:
-            logger.error("Security command processing failed: %s", e, exc_info=True)
-            return OutboundMessage(channel=inbound.channel, content=f"Security command error: {e}", user_id=inbound.user_id, session_id=inbound.session_id)
-
-    # ---------------- Main inbound processing ----------------
-    # Find this function (around line 1054)
+    # ---------------- Main inbound processing (UPGRADED) ----------------
     async def handle_inbound(self, inbound: InboundMessage) -> OutboundMessage:
         """
         [UPGRADED]
@@ -816,7 +608,6 @@ class InteractionCore:
         # All messages are processed intelligently.
         return await self._process_normal_message(inbound)
 
-    # REPLACE this method
     async def _process_normal_message(self, inbound: InboundMessage) -> OutboundMessage:
         """
         [UPGRADED]
@@ -1068,7 +859,7 @@ class InteractionCore:
                 except Exception:
                     logger.debug("Hologram cleanup failed (non-fatal)")
 
-    # ---------------- Proactive enqueue / persistence ----------------
+    # ---------------- Proactive enqueue / persistence (remains the same) ----------------
     async def _enqueue_proactive(self, subject_identity: str, channel: str, payload: Dict[str, Any], deliver_after: float):
         envelope = {
             "id": f"pmsg_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
@@ -1085,7 +876,6 @@ class InteractionCore:
             self._proactive_queue.append(envelope)
             if envelope["deliver_after"] <= time.time():
                 self._proactive_inflight.append(envelope)
-        # async persist
         try:
             asyncio.create_task(self._persist_proactive_queue())
         except Exception:
@@ -1144,14 +934,13 @@ class InteractionCore:
         except Exception as e:
             logger.exception("Failed to load persisted proactive queue: %s", e)
 
-    # ---------------- Proactive worker ----------------
+    # ---------------- Proactive worker (remains the same) ----------------
     async def _proactive_worker(self, poll_interval: float = 1.0):
         retry_base = float(self.config.get("proactive_retry_base", 3.0))
         max_attempts = int(self.config.get("proactive_max_attempts", 5))
         while not self._stop_event.is_set():
             try:
                 now = time.time()
-                # move due items from persistent queue
                 async with self._proactive_lock:
                     self._proactive_queue.sort(key=lambda e: e.get("deliver_after", 0))
                     while self._proactive_queue and self._proactive_queue[0].get("deliver_after", 0) <= now:
@@ -1166,7 +955,6 @@ class InteractionCore:
                         env["attempts"] = env.get("attempts", 0) + 1
                         if delivered:
                             await self._audit("proactive_sent", {"envelope_id": env.get("id"), "payload_preview": str(env.get("payload", {}))[:120]}, {"status": "delivered"})
-                            # cleanup duplicates
                             async with self._proactive_lock:
                                 self._proactive_queue = [e for e in self._proactive_queue if e.get("id") != env.get("id")]
                             await self._persist_proactive_queue()
@@ -1208,58 +996,53 @@ class InteractionCore:
                 await asyncio.sleep(1.0)
         logger.debug("Proactive worker exiting")
 
-    # ---------------- Calendar & Contacts persistence ----------------
+    # ---------------- Calendar & Contacts persistence (remains the same) ----------------
+    # This logic is now DEPRECATED because the agent will call
+    # autonomy.enqueue_action("calendar.add", ...), but we can leave it
+    # as a fallback for the (now-deleted) _interpret_and_execute_actions
     async def _persist_calendar_event(self, event_obj: Dict[str, Any]):
         core = self._get_core()
-        if not core:
-            return
+        if not core: return
         store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store or not hasattr(store, "get") or not hasattr(store, "put"):
-            return
+        if not store or not hasattr(store, "get") or not hasattr(store, "put"): return
         key = "calendar_events"
         try:
             get = getattr(store, "get")
             existing = await get(key) if asyncio.iscoroutinefunction(get) else get(key)
-            if not existing:
-                existing = []
+            if not existing: existing = []
             existing.append(event_obj)
             put = getattr(store, "put")
             try:
                 maybe = put(key, "calendar", existing)
             except TypeError:
                 maybe = put(key, existing)
-            if asyncio.iscoroutine(maybe):
-                await maybe
+            if asyncio.iscoroutine(maybe): await maybe
             await self._audit("calendar_event_persisted", {"event": event_obj}, {"status": "ok"})
         except Exception as e:
             logger.exception("Failed to persist calendar event: %s", e)
 
     async def _persist_contact(self, contact_obj: Dict[str, Any]):
         core = self._get_core()
-        if not core:
-            return
+        if not core: return
         store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store or not hasattr(store, "get") or not hasattr(store, "put"):
-            return
+        if not store or not hasattr(store, "get") or not hasattr(store, "put"): return
         key = "contacts"
         try:
             get = getattr(store, "get")
             existing = await get(key) if asyncio.iscoroutinefunction(get) else get(key)
-            if not existing:
-                existing = []
+            if not existing: existing = []
             existing.append(contact_obj)
             put = getattr(store, "put")
             try:
                 maybe = put(key, "contacts", existing)
             except TypeError:
                 maybe = put(key, existing)
-            if asyncio.iscoroutine(maybe):
-                await maybe
+            if asyncio.iscoroutine(maybe): await maybe
             await self._audit("contact_persisted", {"contact": contact_obj}, {"status": "ok"})
         except Exception as e:
             logger.exception("Failed to persist contact: %s", e)
 
-    # ---------------- Outbound delivery ----------------
+    # ---------------- Outbound delivery (remains the same) ----------------
     async def send_outbound(self, message: OutboundMessage):
         async with self._queue_lock:
             self.outbound_queue.append(message)
@@ -1302,7 +1085,6 @@ class InteractionCore:
                 return True
             except Exception:
                 logger.debug("deliver_hook failed", exc_info=True)
-
         # 2) core.notify
         core = self._get_core()
         if core and hasattr(core, "notify"):
@@ -1316,7 +1098,6 @@ class InteractionCore:
                 return True
             except Exception:
                 logger.debug("core.notify failed", exc_info=True)
-
         # 3) persona.notify
         if self.persona and hasattr(self.persona, "notify"):
             try:
@@ -1326,8 +1107,7 @@ class InteractionCore:
                 return True
             except Exception:
                 logger.debug("persona.notify failed", exc_info=True)
-
-        # 4) fallback: audit/log and treat as delivered
+        # 4) fallback
         try:
             await self._audit("outbound_deliver", {"channel": message.channel, "content_preview": message.content[:120]}, {"status": "logged"})
             return True
@@ -1335,7 +1115,7 @@ class InteractionCore:
             logger.warning("Failed to log outbound deliver as fallback", exc_info=True)
             return False
 
-    # ---------------- Autosave ----------------
+    # ---------------- Autosave (remains the same) ----------------
     async def _autosave_worker(self, interval_sec: float):
         while not self._stop_event.is_set():
             try:
@@ -1347,7 +1127,7 @@ class InteractionCore:
             except Exception:
                 logger.debug("Autosave worker error", exc_info=True)
 
-    # ---------------- Serialization helper ----------------
+    # ---------------- Serialization helper (remains the same) ----------------
     def _serialize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         def _safe(v):
             if v is None or isinstance(v, (str, int, float, bool)):
@@ -1384,132 +1164,13 @@ class InteractionCore:
                 out[str(k)] = str(v)
         return out
 
-    # ---------------- Name handling & security helpers ----------------
-    async def _handle_set_name_directly(self, new_name: str, identity: IdentityProfile, inbound: InboundMessage) -> OutboundMessage:
-        if not new_name:
-            return OutboundMessage(channel=inbound.channel, content="❌ Name cannot be empty. Usage: set_name YourName", user_id=inbound.user_id, session_id=inbound.session_id)
-        try:
-            # update identity
-            try:
-                identity.preferred_name = new_name
-                identity.name = new_name
-            except Exception:
-                pass
+    # ---------------- Name handling & security helpers (DELETED) ----------------
+    # async def _handle_set_name_directly(self, ...) -> OutboundMessage: ...
+    # async def _process_access_command(self, ...) -> OutboundMessage: ...
+    # async def _process_identity_command(self, ...) -> OutboundMessage: ...
+    # def _parse_security_params(self, ...) -> Dict[str, Any]: ...
 
-            # update identity manager if present
-            try:
-                im = getattr(self.security_orchestrator, "identity_manager", None)
-                if im:
-                    try:
-                        if getattr(im, "known_identities", None) and identity.identity_id in im.known_identities:
-                            im.known_identities[identity.identity_id].preferred_name = new_name
-                            im.known_identities[identity.identity_id].name = new_name
-                    except Exception:
-                        pass
-                    if hasattr(im, "persist_identity"):
-                        maybe = im.persist_identity(identity)
-                        if asyncio.iscoroutine(maybe):
-                            await maybe
-            except Exception as e:
-                logger.warning("IdentityManager persist failed (non-fatal): %s", e)
-
-            # persist via persona.core if available
-            try:
-                persona_core = getattr(self.persona, "core", None)
-                if persona_core and hasattr(persona_core, "load_user_profile") and hasattr(persona_core, "save_user_profile"):
-                    profile = await persona_core.load_user_profile() or {}
-                    profile["name"] = new_name
-                    profile["preferred_name"] = new_name
-                    maybe = persona_core.save_user_profile(profile)
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
-                    # also persist small copy into core.store if available
-                    core = self._get_core()
-                    if core and hasattr(core, "store") and hasattr(core.store, "put"):
-                        small = {"name": new_name, "preferred_name": new_name}
-                        put = getattr(core.store, "put")
-                        try:
-                            m2 = put("user_profile_small", "profile", small)
-                        except TypeError:
-                            m2 = put("user_profile_small", small)
-                        if asyncio.iscoroutine(m2):
-                            await m2
-                else:
-                    if hasattr(self.persona, "update_user_profile"):
-                        maybe = self.persona.update_user_profile(name=new_name, preferred_name=new_name)
-                        if asyncio.iscoroutine(maybe):
-                            await maybe
-            except Exception as e:
-                logger.warning("Failed to persist persona user_profile: %s", e)
-
-            # refresh persona context if supported
-            try:
-                maybe = getattr(self.persona, "refresh_profile_context", None)
-                if maybe:
-                    result = maybe()
-                    if asyncio.iscoroutine(result):
-                        await result
-            except Exception:
-                pass
-
-            try:
-                await self._apply_immediate_personalization(identity)
-            except Exception:
-                pass
-
-            return OutboundMessage(channel=inbound.channel, content=f"✅ Name set to: {new_name}", user_id=inbound.user_id, session_id=inbound.session_id)
-        except Exception as e:
-            logger.error("Failed to set name: %s", e, exc_info=True)
-            return OutboundMessage(channel=inbound.channel, content=f"❌ An error occurred while setting name: {e}", user_id=inbound.user_id, session_id=inbound.session_id)
-
-    async def _process_access_command(self, command_str: str, identity: IdentityProfile, inbound: InboundMessage) -> OutboundMessage:
-        try:
-            user_identity = UserIdentity(
-                user_id=identity.identity_id,
-                name=identity.name,
-                preferred_name=identity.preferred_name,
-                access_level=AccessLevel.OWNER_ROOT if identity.relationship == "owner" else AccessLevel.PRIVILEGED,
-                privileges={"full_system_access"} if identity.relationship == "owner" else set(),
-                verification_required=False
-            )
-            parts = command_str.split()
-            if not parts:
-                return OutboundMessage(channel=inbound.channel, content="Access commands: users, add_privileged_user, list_trusted_devices, etc.", user_id=inbound.user_id, session_id=inbound.session_id)
-            subcommand = parts[0]
-            params = self._parse_security_params(parts[1:])
-            ac = getattr(self.security_orchestrator, "access_control", None)
-            if ac and hasattr(ac, "process_management_command"):
-                result = await ac.process_management_command(subcommand, params, user_identity)
-                return OutboundMessage(channel=inbound.channel, content=result, user_id=inbound.user_id, session_id=inbound.session_id)
-            return OutboundMessage(channel=inbound.channel, content="Access control unavailable.", user_id=inbound.user_id, session_id=inbound.session_id)
-        except Exception as e:
-            logger.error("Access command failed '%s': %s", command_str, e, exc_info=True)
-            return OutboundMessage(channel=inbound.channel, content=f"❌ Access command failed: {e}", user_id=inbound.user_id, session_id=inbound.session_id)
-
-    async def _process_identity_command(self, command_str: str, identity: IdentityProfile, inbound: InboundMessage) -> OutboundMessage:
-        try:
-            parts = command_str.split()
-            if not parts:
-                return OutboundMessage(channel=inbound.channel, content="Identity commands: list, set_preferred_name", user_id=inbound.user_id, session_id=inbound.session_id)
-            subcommand = parts[0]
-            params = self._parse_security_params(parts[1:])
-            im = getattr(self.security_orchestrator, "identity_manager", None)
-            if im and hasattr(im, "process_identity_command"):
-                result = await im.process_identity_command(subcommand, params, identity)
-                return OutboundMessage(channel=inbound.channel, content=result, user_id=inbound.user_id, session_id=inbound.session_id)
-            return OutboundMessage(channel=inbound.channel, content="Identity manager unavailable.", user_id=inbound.user_id, session_id=inbound.session_id)
-        except Exception as e:
-            logger.error("Identity command failed '%s': %s", command_str, e, exc_info=True)
-            return OutboundMessage(channel=inbound.channel, content=f"❌ Identity command failed: {e}", user_id=inbound.user_id, session_id=inbound.session_id)
-
-    def _parse_security_params(self, parts: List[str]) -> Dict[str, Any]:
-        params: Dict[str, Any] = {}
-        for part in parts:
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k] = v
-        return params
-
+    # ---------------- Fallback helpers (remains the same) ----------------
     async def _get_rate_limit_fallback(self, query: str) -> str:
         if hasattr(self.cognition, "_get_rate_limit_fallback"):
             fallback = self.cognition._get_rate_limit_fallback(query)
@@ -1526,21 +1187,14 @@ class InteractionCore:
             return fb
         return "[Service temporarily unavailable - please try again later]"
 
-    async def _apply_immediate_personalization(self, identity: IdentityProfile):
-        try:
-            if hasattr(self.persona, "update_user_profile"):
-                maybe = self.persona.update_user_profile(name=identity.preferred_name, timezone="UTC")
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            logger.info("Applied immediate personalization for %s", identity.preferred_name)
-        except Exception:
-            logger.debug("Personalization failed", exc_info=True)
+    # ---------------- (DELETED) ----------------
+    # async def _apply_immediate_personalization(self, ...): ...
 
-    # ---------------- Factory wrapper for compatibility ----------------
+    # ---------------- Factory wrapper (remains the same) ----------------
     async def shutdown(self, wait_seconds: float = 5.0):
         await self.stop(wait_seconds)
 
-# ---------------- Factory ----------------
+# ---------------- Factory (remains the same) ----------------
 async def create_interaction_core(persona: Any = None, cognition: Any = None, autonomy: Any = None, config: Optional[Dict[str, Any]] = None) -> InteractionCore:
     # wire security orchestrator if available on persona.core and not provided explicitly
     cfg = dict(config or {})
