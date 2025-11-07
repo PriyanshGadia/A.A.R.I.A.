@@ -99,3 +99,6 @@ Now the activity in the nodes will be represented as follows:
 Each node and link has it's own glow and they are very small (dot like) but several in quantity.
 
 module is imported but not used, if it is to be used, use it or else remove it.
+
+
+Let's first fix the set_name problem. Pretext, It exists because AARIA is going to be used by others as well ***IMP NOTE: AARIA DOESN'T serve them; rather acts as a mediator for them, collecting their information and relaying their messages***, so for ease, the set_name command exists, which in future will be replaced and will work implicitly (eg:- user:- Hi, I'm Jake. AARIA runs the set_name command itself and sets name as Jake and starts to retrieve and store data into Jake's container after confirming (to prevent mixing of two containers with same names))

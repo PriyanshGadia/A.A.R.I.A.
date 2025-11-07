@@ -634,35 +634,38 @@ class AARIASystem:
                 self.logger.exception("LLMAdapterFactory cleanup failed (non-fatal)")
 
     # Persona persistence helper (tries several candidate persist methods)
-    # Persona persistence helper (tries several candidate persist methods)
     async def _persist_persona_quick(self) -> bool:
-        # --- FIX: This method now saves the MEMORY MANAGER ---
-        memory_manager = self.components.get("memory_manager")
-        if not memory_manager:
-            self.logger.debug("_persist_persona_quick: missing memory_manager")
+        persona = self.components.get("persona")
+        if not persona:
+            self.logger.debug("_persist_persona_quick: missing persona")
             return False
-            
-        # Try to call the save_index method on MemoryManager
-        candidates = ["save_index", "persist_all", "save"]
         
+        # FIXED: This list now matches the actual async persistence methods 
+        # defined in your persona_core.py
+        candidates = ["_persist_memory_index", "_persist_identity_containers"]
+
         for name in candidates:
-            if not hasattr(memory_manager, name):
+            if not hasattr(persona, name):
                 continue
-            method = getattr(memory_manager, name)
+            
+            method = getattr(persona, name)
             try:
-                # --- FIX: save_index expects no args ---
+                # All of these are async in persona_core, so we must await them
                 if inspect.iscoroutinefunction(method):
                     await method()
                 else:
+                    # Fallback for any potential sync methods, though yours are async
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, method)
-                self.logger.info("MemoryManager quick persist succeeded via '%s'", name)
-                return True
+                
+                self.logger.info("Persona quick persist succeeded via '%s'", name)
+                return True # Stop on first success
+            
             except Exception:
-                self.logger.debug("MemoryManager persist via %s failed (trying next)", name, exc_info=True)
+                self.logger.debug("Persona persist via %s failed (trying next)", name, exc_info=True)
                 await asyncio.sleep(0.05)
-        
-        self.logger.error("MemoryManager quick persist failed (no candidate succeeded)")
+                
+        self.logger.error("Persona quick persist failed (no candidate succeeded)")
         return False
         # --- END FIX ---
     # ---------------------------

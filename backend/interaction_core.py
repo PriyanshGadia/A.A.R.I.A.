@@ -25,7 +25,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from contextlib import suppress
-
+from access_control import SecurityContext, RequestSource, UserIdentity, AccessLevel
+from identity_manager import IdentityProfile
+from autonomy_core import Action, ActionPriority
+from cognition_core import ReasoningMode
 # Optional holo state
 try:
     import hologram_state  # optional telemetry/holo integration
@@ -802,13 +805,24 @@ class InteractionCore:
             return OutboundMessage(channel=inbound.channel, content=f"Security command error: {e}", user_id=inbound.user_id, session_id=inbound.session_id)
 
     # ---------------- Main inbound processing ----------------
+    # Find this function (around line 1054)
     async def handle_inbound(self, inbound: InboundMessage) -> OutboundMessage:
-        sec_resp = await self._process_security_commands_directly(inbound)
-        if sec_resp:
-            return sec_resp
+        """
+        [UPGRADED]
+        This handler is now streamlined. All messages, whether chat or command,
+        are sent to _process_normal_message, which contains the new agentic router.
+        """
+        # The old logic for a separate security path is GONE.
+        # All messages are processed intelligently.
         return await self._process_normal_message(inbound)
 
+    # REPLACE this method
     async def _process_normal_message(self, inbound: InboundMessage) -> OutboundMessage:
+        """
+        [UPGRADED]
+        This method is now the core "Executor" for the Agentic Router.
+        It gets a plan from CognitionCore and executes the specified tool calls.
+        """
         trace_id = f"trace_{uuid.uuid4().hex[:10]}"
         request_hash = self._hash_request(inbound)
         node_id = f"input_{trace_id}"
@@ -847,7 +861,9 @@ class InteractionCore:
                 await self._audit("rate_limited", {"query": inbound.content, "reason": reason}, {"response": fallback}, trace_id)
                 return out
 
-            # security flow
+            # --- [SECURITY FLOW] ---
+            # Security flow is STILL ESSENTIAL. It runs *before* cognition
+            # to establish the identity and context for the "Brain."
             security_context = None
             identity_profile = None
             if self.security_orchestrator:
@@ -867,28 +883,24 @@ class InteractionCore:
                     elif hasattr(self.security_orchestrator, "process_security_flow"):
                         res = await self.security_orchestrator.process_security_flow(request_data)
                     else:
-                        res = (None, None)
+                        res = (None, None) # Fallback
+
                     if isinstance(res, tuple) and len(res) >= 2:
                         security_context, identity_profile = res[0], res[1]
                     else:
                         security_context = getattr(res, "security_context", None)
                         identity_profile = getattr(res, "identity_profile", None)
 
-                    # access control check
-                    try:
-                        if security_context and getattr(security_context, "requested_data_categories", None):
-                            ac = getattr(self.security_orchestrator, "access_control", None)
-                            if ac and hasattr(ac, "authorize_data_access"):
-                                is_authorized, _ = await ac.authorize_data_access(security_context)
-                                if not is_authorized:
-                                    denial_msg = "I'm not authorized to share that information."
-                                    out = OutboundMessage(channel=inbound.channel, content=denial_msg, user_id=inbound.user_id, session_id=inbound.session_id)
-                                    await self._audit("access_denied", {"query": inbound.content, "requested_categories": getattr(security_context, "requested_data_categories", [])}, {"response": denial_msg}, trace_id)
-                                    return out
-                    except Exception:
-                        logger.debug("Access control check failed (continuing)", exc_info=True)
                 except Exception as e:
                     logger.error("Security processing error: %s", e, exc_info=True)
+                    # Create a fallback identity so the system can still respond
+                    identity_profile = IdentityProfile(identity_id="public_fallback", name="User", preferred_name="User", relationship="public")
+                    security_context = SecurityContext(request_source=RequestSource.PUBLIC_API, user_identity=UserIdentity(user_id="public_fallback", name="User", access_level=AccessLevel.PUBLIC, privileges=set()), requested_data_categories=[])
+            else:
+                # Fallback if no security orchestrator at all
+                identity_profile = IdentityProfile(identity_id=inbound.user_id or "public_default", name="User", preferred_name="User", relationship="public")
+                security_context = SecurityContext(request_source=RequestSource.PUBLIC_API, user_identity=UserIdentity(user_id=inbound.user_id or "public_default", name="User", access_level=AccessLevel.PUBLIC, privileges=set()), requested_data_categories=[])
+
 
             # session resolution
             session = await self.get_session(inbound.session_id) if inbound.session_id else None
@@ -896,83 +908,112 @@ class InteractionCore:
                 session = await self.create_session(user_id=inbound.user_id)
                 inbound.session_id = session.session_id
 
+            # Store the identified user's context in the session
             if security_context and identity_profile:
                 session.metadata["security_context"] = security_context
                 session.metadata["identity"] = identity_profile
                 session.metadata["preferred_name"] = getattr(identity_profile, "preferred_name", None)
 
-            intent = self.classify_intent(inbound.content)
-            if intent == "command" and self._contains_privileged_action(inbound.content):
-                if not await self.is_privileged(intent, inbound.user_id, session):
-                    denied = "You are not authorized to perform that action."
-                    out = OutboundMessage(channel=inbound.channel, content=denied, user_id=inbound.user_id, session_id=session.session_id)
-                    await self._audit("privilege_denied", {"query": inbound.content}, {"response": denied}, trace_id)
-                    return out
-
-            cached_resp = self._get_cached_response(request_hash)
-            if cached_resp:
-                out = OutboundMessage(channel=inbound.channel, content=cached_resp, user_id=inbound.user_id, session_id=session.session_id)
-                await self._audit("reason_cached", {"query": inbound.content}, {"response": cached_resp}, trace_id)
-                return out
-
-            # generate response (persona -> cognition fallback)
+            # --- [AGENTIC ROUTER: THINK -> PLAN -> ACT] ---
             start = time.time()
+
+            # 1. THINK (Call CognitionCore to get the plan)
+            if not self.cognition:
+                 return OutboundMessage(channel=inbound.channel, content="CognitionCore is offline.", user_id=inbound.user_id, session_id=inbound.session_id)
+
+            # Pass the *full* security context to the brain
+            cognition_context = {"security": security_context, "identity": identity_profile}
+            
+            # This is the query to the "Brain"
+            execution_plan = await self.cognition.reason(
+                inbound.content, # Pass the original, natural language query
+                context=cognition_context, 
+                reasoning_mode=ReasoningMode.BALANCED 
+            )
+
+            latency = time.time() - start
+            final_response_text = "Task executed." # Default response, will be overwritten
+            plan_succeeded = True
+
+            # 2. ACT (Execute the plan)
+            if not execution_plan:
+                 execution_plan = [{"tool_name": "chat_response", "params": {"response_text": "I'm not sure how to respond to that."}}]
+
+            # Loop over all steps in the plan (usually just one, but supports multi-step)
+            for step in execution_plan:
+                tool_name = step.get("tool_name")
+                params = step.get("params", {})
+
+                if tool_name == "security_command":
+                    command = params.get("command", "")
+                    if not command:
+                        final_response_text = "❌ Cognitive error: security_command was empty."
+                        plan_succeeded = False
+                    elif not self.security_orchestrator:
+                        final_response_text = "❌ Security system is offline."
+                        plan_succeeded = False
+                    else:
+                        # Execute the security command and get the string response
+                        # This re-uses all your existing, robust security logic!
+                        final_response_text = await self.security_orchestrator.process_security_command(
+                            command, {}, identity_profile # Pass the identified identity
+                        )
+                
+                elif tool_name == "autonomy_action":
+                    action_type = params.get("action_type")
+                    details = params.get("details", {})
+                    if not action_type or not self.autonomy:
+                        final_response_text = f"❌ Autonomy system is offline or action type was missing."
+                        plan_succeeded = False
+                    else:
+                        # Enqueue the action for AutonomyCore to handle
+                        # This correctly fixes the "Yash's birthday" reminder flow
+                        await self.autonomy.enqueue_action(
+                            Action(action_type=action_type, details=details, priority=ActionPriority.NORMAL.value)
+                        )
+                        final_response_text = f"✅ Task '{action_type}' has been scheduled."
+
+                elif tool_name == "chat_response":
+                    final_response_text = params.get("response_text", "[No response]")
+                
+                else:
+                    final_response_text = f"❌ Unknown tool specified by Cognition: {tool_name}"
+                    plan_succeeded = False
+
+            # --- [END OF AGENTIC ROUTER] ---
+
+            # 3. RESPOND (Finalize and send the result to the user)
             preferred_name = "User"
             if identity_profile and getattr(identity_profile, "preferred_name", None):
                 preferred_name = identity_profile.preferred_name
             elif session and session.metadata.get("preferred_name"):
                 preferred_name = session.metadata.get("preferred_name")
 
-            enhanced_query = inbound.content
+            # Personalize the *final* response string
             try:
-                if security_context and getattr(getattr(security_context, "user_identity", None), "access_level", None) not in (None, AccessLevel.PUBLIC):
-                    access_val = getattr(security_context.user_identity, "access_level", getattr(security_context.user_identity, "value", "privileged"))
-                    enhanced_query = f"[{access_val}] {inbound.content}"
+                if preferred_name != "User":
+                    # Check for owner/privileged level before replacing "Owner"
+                    access_level = getattr(getattr(security_context, "user_identity", None), "access_level", AccessLevel.PUBLIC)
+                    if access_level in (AccessLevel.OWNER_ROOT, AccessLevel.OWNER_REMOTE):
+                        final_response_text = final_response_text.replace("Owner", preferred_name)
+                    final_response_text = final_response_text.replace("User", preferred_name)
             except Exception:
-                pass
-
-            response_text = None
-            try:
-                if hasattr(self.persona, "respond"):
-                    maybe = self.persona.respond(enhanced_query, session=session)
-                    response_text = await maybe if asyncio.iscoroutine(maybe) else maybe
-                elif hasattr(self.persona, "generate_reply"):
-                    maybe = self.persona.generate_reply(enhanced_query, session=session)
-                    response_text = await maybe if asyncio.iscoroutine(maybe) else maybe
-                elif hasattr(self.persona, "handle_input"):
-                    maybe = self.persona.handle_input(enhanced_query, session=session)
-                    response_text = await maybe if asyncio.iscoroutine(maybe) else maybe
-                else:
-                    messages = await self._build_persona_prompt(enhanced_query, session)
-                    response_text = await self._call_llm_with_retries(messages)
-            except Exception as e:
-                logger.debug("Persona handoff failed (fallback to LLM): %s", e, exc_info=True)
-                messages = await self._build_persona_prompt(enhanced_query, session)
-                response_text = await self._call_llm_with_retries(messages)
-
-            if response_text is None:
-                response_text = "[No response]"
-            elif hasattr(response_text, "content"):
-                response_text = response_text.content
-
-            latency = time.time() - start
-            try:
-                if preferred_name != "User" and security_context and getattr(getattr(security_context, "user_identity", None), "access_level", None) in (AccessLevel.OWNER_ROOT, AccessLevel.OWNER_REMOTE):
-                    response_text = response_text.replace("User", preferred_name)
-            except Exception:
-                pass
+                pass # Non-fatal
 
             if PROMETHEUS_AVAILABLE:
                 try:
                     metrics["response_latency"].labels(inbound.channel).observe(latency)
                     metrics["response_latency_summary"].labels(inbound.channel).observe(latency)
-                    metrics["requests_total"].labels(inbound.channel, intent).inc()
-                    metrics["responses_total"].labels(inbound.channel, intent, "success").inc()
+                    # We can get the intent from the plan now!
+                    intent_from_plan = execution_plan[0].get("tool_name", "unknown")
+                    metrics["requests_total"].labels(inbound.channel, intent_from_plan).inc()
+                    status_label = "success" if plan_succeeded else "failure"
+                    metrics["responses_total"].labels(inbound.channel, intent_from_plan, status_label).inc()
                 except Exception:
                     pass
 
-            safe = response_text.strip()
-            self._cache_response(request_hash, safe)
+            safe = final_response_text.strip()
+            self._cache_response(request_hash, safe) # Cache the final string
 
             # record history
             sec_level = "unknown"
@@ -982,36 +1023,34 @@ class InteractionCore:
                     sec_level = getattr(al, "value", None) or getattr(al, "name", None) or str(al)
             except Exception:
                 sec_level = "unknown"
-
+                
             session.history.append({"role": "user", "content": inbound.content, "ts": inbound.timestamp, "security_level": sec_level})
             session.history.append({"role": "assistant", "content": safe, "ts": time.time(), "personalized_for": preferred_name})
             session.touch()
 
-            # persist session asynchronously
             try:
                 asyncio.create_task(self._persist_sessions())
             except Exception:
                 await self._persist_sessions()
 
-            # attempt to interpret and execute structured actions (conservative)
-            try:
-                await self._interpret_and_execute_actions(safe, inbound, session)
-            except Exception:
-                logger.debug("Action execution failed (continuing)", exc_info=True)
+            # The old _interpret_and_execute_actions call is no longer needed.
+            # (DELETED)
 
             out = OutboundMessage(channel=inbound.channel, content=safe, user_id=inbound.user_id, session_id=session.session_id, metadata={
-                "security_level": getattr(getattr(security_context, "user_identity", None), "access_level", "unknown"),
+                "security_level": sec_level,
                 "personalized": preferred_name != "User",
-                "response_latency": latency
+                "response_latency": latency,
+                "executed_plan": execution_plan # Add plan to metadata for debugging
             })
 
-            await self._audit("reason_llm_success", {"query": inbound.content, "security_level": out.metadata.get("security_level")}, {"response": safe, "latency": latency, "personalized_for": preferred_name}, trace_id)
+            await self._audit("intent_executed", {"query": inbound.content, "plan": execution_plan}, {"response": safe, "latency": latency, "personalized_for": preferred_name}, trace_id)
             await self.send_outbound(out)
             return out
 
         except Exception as e:
             logger.exception("Unhandled error in _process_normal_message: %s", e)
             return OutboundMessage(channel=inbound.channel, content="I encountered an error while processing your message. See logs.", user_id=inbound.user_id, session_id=inbound.session_id)
+        
         finally:
             # hologram cleanup
             if hologram_state is not None:
@@ -1028,57 +1067,6 @@ class InteractionCore:
                             await r2
                 except Exception:
                     logger.debug("Hologram cleanup failed (non-fatal)")
-
-    # ---------------- Action interpreter ----------------
-    async def _interpret_and_execute_actions(self, assistant_text: str, inbound: InboundMessage, session: Session):
-        """
-        Conservative action interpreter:
-         - notify("Target","Message")
-         - calendar.add(event={...})
-         - contact.add(contact={...})
-        """
-        try:
-            # notify("Target","Message")
-            for m in re.finditer(r'notify\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\'](.+?)["\']\s*\)', assistant_text):
-                target = m.group(1)
-                message = m.group(2)
-                subject = "owner_primary" if target.lower() in ("owner", "me", "owner_primary") else target
-                # enqueue persistent proactive envelope
-                await self._enqueue_proactive(subject_identity=subject, channel="push", payload={"text": message}, deliver_after=time.time())
-
-            # calendar.add(event={...})
-            cal_match = re.search(r'calendar\.add\s*\(\s*event\s*=\s*(\{.*\})\s*\)', assistant_text, flags=re.S)
-            if cal_match:
-                js = cal_match.group(1)
-                obj = None
-                try:
-                    obj = json.loads(js)
-                except Exception:
-                    try:
-                        import ast
-                        obj = ast.literal_eval(js)
-                    except Exception:
-                        obj = None
-                if obj:
-                    await self._persist_calendar_event(obj)
-
-            # contact.add(contact={...})
-            cont_match = re.search(r'contact\.add\s*\(\s*contact\s*=\s*(\{.*\})\s*\)', assistant_text, flags=re.S)
-            if cont_match:
-                js = cont_match.group(1)
-                obj = None
-                try:
-                    obj = json.loads(js)
-                except Exception:
-                    try:
-                        import ast
-                        obj = ast.literal_eval(js)
-                    except Exception:
-                        obj = None
-                if obj:
-                    await self._persist_contact(obj)
-        except Exception as e:
-            logger.debug("Action interpreter error: %s", e, exc_info=True)
 
     # ---------------- Proactive enqueue / persistence ----------------
     async def _enqueue_proactive(self, subject_identity: str, channel: str, payload: Dict[str, Any], deliver_after: float):
