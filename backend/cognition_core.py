@@ -517,7 +517,7 @@ class CognitionCore:
                      reasoning_mode: ReasoningMode = ReasoningMode.BALANCED,
                      use_llm: bool = True, max_retries: int = 2) -> List[Dict[str, Any]]:
         """
-        [UPGRADED - v4]
+        [UPGRADED - v5]
         This version now robustly finds the JSON block
         even if the LLM adds conversational text.
         """
@@ -536,6 +536,7 @@ class CognitionCore:
         request_hash = self._hash_request(query, context)
 
         if await self._is_duplicate_request(request_hash):
+            if holo_ok: await self._cleanup_hologram_task(node_id, link_id) # Cleanup
             return [{"tool_name": "chat_response", "params": {"response_text": "Processing previous request..."}}]
 
         fast_response = self._try_fast_reasoning(query)
@@ -543,7 +544,7 @@ class CognitionCore:
             latency = _now_loop_time() - start_time
             plan = [{"tool_name": "chat_response", "params": {"response_text": fast_response}}]
             await self._record_trace(query, fast_response, reasoning_mode, latency, 0.9)
-            if holo_ok: await self._cleanup_hologram_task(node_id, link_id) # Cleanup on fast path
+            if holo_ok: await self._cleanup_hologram_task(node_id, link_id) # Cleanup
             return plan
 
         if not await self.llm_circuit_breaker.can_execute():
@@ -640,13 +641,10 @@ class CognitionCore:
                     await asyncio.sleep(0.5 * (2 ** attempt))
             
                 finally:
-                    # --- [FIXED] ---
-                    # Ensure cleanup happens even inside the loop
                     if holo_ok:
                         await self._cleanup_hologram_task(node_id, link_id)
-                        holo_ok = False # Prevent double cleanup
-                    # --- [END FIX] ---
-
+                        holo_ok = False
+        
         # final fallback
         fallback_text = self._get_fallback_reasoning(query)
         fallback_plan = [{"tool_name": "chat_response", "params": {"response_text": fallback_text}}]
@@ -1158,51 +1156,51 @@ class CognitionCore:
     # --- [END REPLACED] ---
     def _build_enhanced_prompt(self, query: str, context: Dict[str, Any], reasoning_mode: ReasoningMode) -> List[Dict[str, str]]:
         """
-        [UPGRADED]
-        This prompt now instructs the LLM to act as a tool-calling agent
-        and respond *only* in the JSON format we require.
+        [UPGRADED - v2]
+        This prompt is now *stricter* to force the LLM to choose
+        the correct tool instead of just chatting.
         """
         ev: EmotionalVector = self.cognitive_state["emotional_vector"]
         
-        # 1. Get the base persona prompt from PersonaCore
-        base_system_prompt = "You are A.A.R.I.A." # Fallback
+        base_system_prompt = "You are A.A.R.I.A."
         if self.persona and hasattr(self.persona, "system_prompt") and self.persona.system_prompt:
             base_system_prompt = self.persona.system_prompt
         
-        # 2. Add agentic/tool-calling instructions
+        # --- [CRITICAL PROMPT FIX] ---
+        # Instructions are now more direct and forceful.
         system_parts = [
             base_system_prompt, # This includes the personality, user name, date, etc.
             "\n--- AGENTIC INSTRUCTIONS ---",
-            "Your primary goal is to analyze user requests and translate them into a structured execution plan.",
-            "You MUST respond *only* with a valid JSON list of one or more 'tool_calls'.",
-            "A 'tool_call' is an object with 'tool_name' and 'params'.",
+            "You are an agentic router. Your ONLY goal is to analyze the user's query and output a JSON list of tool calls.",
+            "You MUST *ALWAYS* respond with a valid JSON list.",
+            "NEVER add conversational text, greetings, or apologies before or after the JSON.",
             "Analyze the user's intent and select the appropriate tool(s) from the manifest.",
             "--- TOOL MANIFEST START ---",
             json.dumps(self.TOOL_MANIFEST, indent=2),
             "--- TOOL MANIFEST END ---",
             f"Current Emotional Context: Calm {ev.calm:.2f}, Alert {ev.alert:.2f}, Stress {ev.stress:.2f}",
-            "If the user is just chatting (e.g., 'hi', 'who are you?'), use the 'chat_response' tool.",
-            "If a user states their name (e.g., 'I'm Jake' or 'call me Skye'), use the 'security_command' tool to create or update their identity.",
-            "If a user asks to do something (e.g., 'remind me about Yash's birthday'), use the 'autonomy_action' tool.",
-            "Always respond with a JSON list, even for a simple chat."
+            "--- EXAMPLES ---",
+            "User: 'hi' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi there! What can I help you with?\"}}]",
+            "User: 'call me Master' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=Master\"}}]",
+            "User: 'remind me to check logs' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"notify\", \"details\": {\"message\": \"Reminder: check logs\"}}}]",
+            "--- END EXAMPLES ---",
+            "Always respond with a JSON list."
         ]
+        # --- [END FIX] ---
 
         messages = [
             {"role": "system", "content": "\n".join(system_parts)},
             {"role": "user", "content": query}
         ]
 
-        # 3. Add conversation history from PersonaCore
         if self.persona and hasattr(self.persona, "conv_buffer"):
-             for interaction in list(self.persona.conv_buffer)[-6:]: # Get last 3 exchanges
+             for interaction in list(self.persona.conv_buffer)[-6:]:
                 messages.append({"role": interaction["role"], "content": interaction["content"]})
 
-        # 4. Add security context
         if context:
             try:
                 identity = context.get("identity")
                 security = context.get("security")
-                
                 sec_ctx_summary = {
                     "user_id": getattr(identity, 'identity_id', 'unknown'),
                     "name": getattr(identity, 'preferred_name', 'User'),
@@ -1213,6 +1211,9 @@ class CognitionCore:
             except Exception as e:
                 logger.debug(f"Failed to build security context for prompt: {e}")
                 messages.append({"role": "system", "content": "System Context: Default (no security info)"})
+        
+        # The final message in the list must be the user query
+        messages.append({"role": "user", "content": query})
 
         return messages
 
