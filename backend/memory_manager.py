@@ -106,6 +106,28 @@ class MemoryManager:
     def _audit_key(self) -> str:
         return self._root_key(AUDIT_NAMESPACE)
     
+    def _decide_segment(self, user_input: str, assistant_response: str, metadata: Dict, subject_id: str) -> str:
+        """
+        --- ADDED THIS METHOD ---
+        Implements the segmentation logic from the README.
+        """
+        # 1. Check for explicit public tag
+        if metadata and metadata.get("segment") == SEG_PUBLIC:
+            return SEG_PUBLIC
+        
+        # 2. Check for explicit privileged access tag
+        if metadata and metadata.get("segment") == SEG_ACCESS:
+            return SEG_ACCESS
+            
+        # 3. Default for Owner is always Confidential
+        if subject_id == "owner_primary":
+            return SEG_CONFIDENTIAL
+            
+        # 4. Default for others (like "John") is Access Data
+        # This assumes data *about* others is "Access" by default,
+        # which the owner can then see.
+        return SEG_ACCESS
+    
     def _transcript_index_key(self, identity_id: str) -> str:
         return self._root_key("transcript_index", identity_id)
 
@@ -115,7 +137,7 @@ class MemoryManager:
     # -----------------------
     # Low-level store helpers (robust)
     # -----------------------
-    async def _store_put(self, key: str, obj: Any) -> bool:
+    async def _store_put(self, key: str, obj: Any, type_name: str = "root") -> bool:
         """Put object into underlying store; tolerant to sync/async store implementations."""
         if self.store is None:
             # in-memory fallback (protected by lock)
@@ -133,21 +155,17 @@ class MemoryManager:
                     except Exception:
                         pass
                 raise RuntimeError("No put method on store")
-            # Many store APIs accept (key, category, object) or (key, object)
-            try:
-                maybe = put(key, "root", obj)
-            except TypeError:
-                try:
-                    maybe = put(key, obj)
-                except TypeError:
-                    maybe = put(obj)
+
+            # --- FIX: Always use the (key, type, obj) signature ---
+            maybe = put(key, type_name, obj)
+            # --- END FIX ---
+
             if inspect.iscoroutine(maybe):
                 await maybe
             return True
         except Exception as e:
             logger.warning(f"_store_put failed for key {key}: {e}")
-            async with self._locks["store"]:
-                self._inmem[key] = obj
+            # Do NOT fall back to in-mem here, as it causes state divergence
             return False
 
     async def _store_get(self, key: str) -> Optional[Any]:
@@ -259,14 +277,16 @@ class MemoryManager:
             ok = await self._holo_spawn(node_id, "memory", "Memory Write", 4, source_id="Memory", link_id=link_id)
             if ok:
                 await self._holo_set_active("Memory")
-                await self._holo_update_link("link_cog_mem", 0.9)
+                # --- FIX: Pulse the link_id that was passed in ---
+                await self._holo_update_link(link_id, 0.9)
                 await asyncio.sleep(_HOLO_MEDIUM)
-                await self._holo_update_link("link_cog_mem", 0.2)
+                await self._holo_update_link(link_id, 0.2)
+                # --- END FIX ---
                 await self._holo_set_idle("Memory")
                 await self._holo_despawn(node_id, link_id)
         except Exception as e:
             logger.debug(f"Holo write animation exception: {e}")
-
+            
     async def _holo_animate_read(self, node_id: str, link_id: str):
         """Background animation for reads."""
         try:

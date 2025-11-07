@@ -138,6 +138,13 @@ class PersonaCore:
         self.config = getattr(self.core, 'config', {}) or {}
         self.system_prompt: Optional[str] = None
         self.conv_buffer: deque = deque(maxlen=ST_BUFFER_SIZE)
+        
+        # --- FIX: These are now CACHES, not the source of truth ---
+        self.memory_index: List[Dict[str, Any]] = []
+        self.transcript_store: deque = deque(maxlen=5000)
+        self.semantic_index: List[Dict[str, Any]] = []
+        # --- END FIX ---
+
         self.llm_orchestrator = LLMAdapterFactory
         self.response_cache: Dict[str, Tuple[str, float]] = {}
         self._interaction_count = 0
@@ -147,7 +154,6 @@ class PersonaCore:
         self._initialized = False
 
         # Memory manager will be injected by main.py (AARIASystem) if available.
-        # initialize to None here; initialize() will wire from core if present.
         self.memory_manager: Optional[Any] = None
 
         # --- FIX: Proactive communicator will be injected by main.py ---
@@ -279,17 +285,15 @@ class PersonaCore:
 
         await self._init_system_prompt()
 
-        # Try to load memory (prefer MemoryManager)
-        try:
-            await self._load_persistent_memory()
-        except Exception as e:
-            logger.error(f"❌ Memory loading failed, starting fresh: {e}", exc_info=True)
-            self.memory_index = []
+        # --- FIX: Removed call to self._load_persistent_memory() ---
+        # --- Memory is now loaded on-demand by retrieve_memory ---
 
         self._cleanup_old_memories()
 
         # Add a test memory to verify the system works
-        if len(self.memory_index) == 0:
+        if not self.memory_manager:
+            logger.error("No MemoryManager present; skipping test memory creation.")
+        elif len(self.memory_index) == 0: # Note: self.memory_index is just a cache
             try:
                 test_memory_id = await self.store_memory(
                     "System initialized",
@@ -304,19 +308,21 @@ class PersonaCore:
         try:
             mm = getattr(self, "memory_manager", None)
             if mm:
-                maybe_ts = getattr(mm, "load_transcript_store", None)
-                if maybe_ts:
-                    ts = maybe_ts()
-                    ts = await ts if inspect.iscoroutine(ts) else ts
-                    if isinstance(ts, list):
-                        for t in ts[-1000:]:
-                            self.transcript_store.append(t)
-                maybe_si = getattr(mm, "load_semantic_index", None)
-                if maybe_si:
-                    si = maybe_si()
-                    si = await si if inspect.iscoroutine(si) else si
-                    if isinstance(si, list):
-                        self.semantic_index = si[-MAX_MEMORY_ENTRIES:]
+                if hasattr(mm, "load_transcript_store"): # This method doesn't exist, but good to check
+                    maybe_ts = getattr(mm, "load_transcript_store", None)
+                    if maybe_ts:
+                        ts = maybe_ts()
+                        ts = await ts if inspect.iscoroutine(ts) else ts
+                        if isinstance(ts, list):
+                            for t in ts[-1000:]:
+                                self.transcript_store.append(t)
+                if hasattr(mm, "load_semantic_index"): # This method doesn't exist, but good to check
+                    maybe_si = getattr(mm, "load_semantic_index", None)
+                    if maybe_si:
+                        si = maybe_si()
+                        si = await si if inspect.iscoroutine(si) else si
+                        if isinstance(si, list):
+                            self.semantic_index = si[-MAX_MEMORY_ENTRIES:]
         except Exception:
             logger.debug("Failed to restore transcript/semantic index from MemoryManager (non-fatal).")
 
@@ -348,6 +354,17 @@ class PersonaCore:
         except Exception as e:
             logger.warning(f"Failed to start PersonaCore daemons: {e}", exc_info=True)
 
+        # Start internal daemons (proactive, maintenance, cognition monitor)
+        try:
+            self._running = True
+            loop = asyncio.get_event_loop()
+            self._daemon_tasks.append(loop.create_task(self._proactive_loop()))
+            self._daemon_tasks.append(loop.create_task(self._maintenance_loop()))
+            self._daemon_tasks.append(loop.create_task(self._cognition_monitor()))
+            logger.info("✅ PersonaCore background daemons started (proactive, maintenance, monitor).")
+        except Exception as e:
+            logger.warning(f"Failed to start PersonaCore daemons: {e}", exc_info=True)
+
     def is_ready(self) -> bool:
         """Comprehensive health check readiness probe."""
         return (self._initialized and
@@ -362,10 +379,10 @@ class PersonaCore:
     async def _init_system_prompt(self) -> None:
         """Initialize system prompt with robust error recovery."""
         try:
-            # --- ADD THIS LINE ---
+            # --- ADD THIS LINE FOR IST ---
             IST = ZoneInfo("Asia/Kolkata")
             # --- END ADD ---
-
+            
             profile = {}
             # prefer core.load_user_profile if available (non-blocking)
             if hasattr(self.core, "load_user_profile"):
@@ -396,14 +413,20 @@ class PersonaCore:
                 user_name = profile.get("name") or "User"
             
             # --- FIX: Set default timezone to IST ---
-            timezone = profile.get("timezone", "IST").strip() or "IST"
-            current_date = datetime.now(IST).strftime("%Y-%m-%d %H:%M %Z")
+            timezone_str = profile.get("timezone", "IST").strip() or "IST"
+            try:
+                # Validate timezone, fallback to IST
+                tz = ZoneInfo(timezone_str)
+            except Exception:
+                tz = IST
+                timezone_str = "IST"
+            current_date = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
             # --- END FIX ---
 
             # --- FIX: Removed TOOL_INSTRUCTION_BLOCK to prevent hallucination ---
             self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
                 user_name=user_name,
-                timezone=timezone,
+                timezone=timezone_str,
                 current_date=current_date,
                 tone_instructions=self.tone_instructions
             )
@@ -413,6 +436,7 @@ class PersonaCore:
         except Exception as e:
             logger.error(f"Failed to initialize system prompt: {e}", exc_info=True)
             # Fallback prompt, also without tools
+            IST = ZoneInfo("Asia/Kolkata")
             self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
                 user_name="User",
                 timezone="IST",
@@ -459,101 +483,6 @@ class PersonaCore:
     # -----------------------
     # Persistent memory load/save (delegates to MemoryManager if available)
     # -----------------------
-    async def _load_persistent_memory(self) -> None:
-        """Load persistent memory. Prefer MemoryManager (identity containers)."""
-        mm = getattr(self, "memory_manager", None)
-        try:
-            if mm:
-                # Try common method names defensively
-                if hasattr(mm, "load_index"):
-                    maybe = mm.load_index()
-                    memory_data = await maybe if inspect.iscoroutine(maybe) else maybe
-                elif hasattr(mm, "get_root_index"):
-                    maybe = mm.get_root_index()
-                    memory_data = await maybe if inspect.iscoroutine(maybe) else maybe
-                elif hasattr(mm, "export_memory_snapshot"):
-                    # some managers expose a snapshot
-                    maybe = mm.export_memory_snapshot("owner_primary")
-                    memory_data = await maybe if inspect.iscoroutine(maybe) else maybe
-                else:
-                    memory_data = None
-
-                if isinstance(memory_data, dict) and "memory_index" in memory_data:
-                    self.memory_index = [m for m in memory_data["memory_index"] if isinstance(m, dict) and m.get('user') and m.get('assistant')]
-                    self.memory_index = self.memory_index[-MAX_MEMORY_ENTRIES:]
-                    logger.info(f"✅ Loaded {len(self.memory_index)} enhanced memory entries from MemoryManager.")
-                    return
-                elif memory_data:
-                    logger.warning(f"📂 MemoryManager returned unexpected format: {type(memory_data)}")
-                else:
-                    logger.info("📂 MemoryManager has no persisted index - starting fresh locally.")
-            # Fallback to core.store usage
-            if hasattr(self.core, 'store') and hasattr(self.core.store, "get"):
-                get = getattr(self.core.store, "get")
-                maybe = None
-                try:
-                    maybe = get("enhanced_memory_index")
-                except TypeError:
-                    # try alternate signature
-                    maybe = get("enhanced_memory_index", "persona_memory")
-                memory_data = await maybe if inspect.iscoroutine(maybe) else maybe
-                logger.debug(f"📂 Loading persistent memory via core.store: found {type(memory_data)}")
-                if isinstance(memory_data, dict) and "memory_index" in memory_data:
-                    self.memory_index = [m for m in memory_data["memory_index"] if isinstance(m, dict) and m.get('user') and m.get('assistant')]
-                    self.memory_index = self.memory_index[-MAX_MEMORY_ENTRIES:]
-                    logger.info(f"✅ Loaded {len(self.memory_index)} enhanced memory entries from storage.")
-                elif memory_data:
-                    logger.warning(f"📂 Unexpected memory data format: {type(memory_data)}")
-                else:
-                    logger.info("📂 No existing memory data found - starting fresh.")
-        except Exception as e:
-            logger.error(f"❌ Failed to load persistent memory: {e}", exc_info=True)
-            self.memory_index = []
-
-    async def save_persistent_memory(self) -> None:
-        """Save persistent memory. Prefer MemoryManager's save API, fallback to core.store."""
-        mm = getattr(self, "memory_manager", None)
-        memory_data = {
-            "memory_index": self.memory_index,
-            "timestamp": time.time(),
-            "count": len(self.memory_index)
-        }
-        try:
-            if mm:
-                # Try common method names defensively
-                if hasattr(mm, "save_index"):
-                    maybe = mm.save_index(memory_data)
-                    if inspect.iscoroutine(maybe):
-                        await maybe
-                    logger.info("💾 Persisted memory index via MemoryManager.save_index()")
-                    return
-                elif hasattr(mm, "put_index"):
-                    maybe = mm.put_index(memory_data)
-                    if inspect.iscoroutine(maybe):
-                        await maybe
-                    logger.info("💾 Persisted memory index via MemoryManager.put_index()")
-                    return
-                else:
-                    # Try generic write to root container
-                    if hasattr(mm, "write_root_record"):
-                        maybe = mm.write_root_record("enhanced_memory_index", memory_data)
-                        if inspect.iscoroutine(maybe):
-                            await maybe
-                        logger.info("💾 Persisted memory index via MemoryManager.write_root_record()")
-                        return
-            # Fallback to core.store
-            if hasattr(self.core, 'store') and hasattr(self.core.store, "put"):
-                put = getattr(self.core.store, "put")
-                try:
-                    maybe = put("enhanced_memory_index", "persona_memory", memory_data)
-                except TypeError:
-                    maybe = put("enhanced_memory_index", memory_data)
-                if inspect.iscoroutine(maybe):
-                    await maybe
-                logger.info(f"💾 Persisted {len(self.memory_index)} memory entries to storage via core.store.")
-        except Exception as e:
-            logger.error(f"❌ Failed to save persistent memory: {e}", exc_info=True)
-
     def _cleanup_old_memories(self) -> None:
         """Remove memories older than MAX_MEMORY_AGE_DAYS, preserving important ones.
         If MemoryManager supports pruning, delegate to it."""
@@ -617,61 +546,11 @@ class PersonaCore:
             intent = intent or self._classify_query_intent(user_input)
             content_hash = hashlib.md5(f"{user_input}{assistant_response}".encode("utf-8")).hexdigest()[:16]
 
-            # 1. Build the main Memory Record
-            memory_id = f"mem_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
-            memory_record: Dict[str, Any] = {
-                "id": memory_id,
-                "subject_id": subject_identity_id,
-                "user": user_input,
-                "assistant": assistant_response,
-                "source": "assistant_generated", # Simplified, you can restore full logic
-                "confidence": 0.65,
-                "verified": False,
-                "timestamp": time.time(),
-                "content_hash": content_hash,
-                "importance": int(max(1, min(5, importance))),
-                "access_count": 0,
-                "owner_view": f"User: {user_input} | Assistant: {assistant_response}",
-                "public_view": "A conversation took place regarding a personal topic.",
-                "metadata": {
-                    **(metadata or {}),
-                    "auto_provenance": True,
-                    "intent": intent,
-                    "importance_reason": self._get_importance_reason(user_input, intent or {}, importance)
-                }
-            }
-
-            # 2. Build the Transcript Entry
-            transcript_entry = {
-                "id": f"tx_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-                "memory_id": memory_id,
-                "subject_id": subject_identity_id,
-                "user": user_input,
-                "assistant": assistant_response,
-                "timestamp": time.time(),
-                "content_hash": content_hash,
-                "semantic_markers": self._extract_entities(f"{user_input}\n{assistant_response}")
-            }
-
-            # 3. Build the Semantic Record
-            semantic_record = {
-                "id": f"sem_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-                "memory_id": memory_id,
-                "subject_id": subject_identity_id,
-                "summary": (assistant_response[:240] + "...") if assistant_response and len(assistant_response) > 240 else (assistant_response or ""),
-                "entities": transcript_entry.get("semantic_markers", {}),
-                "timestamp": time.time(),
-                "importance": memory_record["importance"],
-            }
-            # --- END DUAL-MEMORY LOGIC ---
-
             # --- DELEGATION TO MEMORY MANAGER ---
-            # Now, persist all three records using the manager
-            
-            # Store the main record (MemoryManager handles segmentation & duplicates)
+            # 1. Store the main record (MemoryManager handles segmentation & duplicates)
             mem_id, segment = await self.memory_manager.store_memory(
-                user_input,
-                assistant_response,
+                user_input=user_input,
+                assistant_response=assistant_response,
                 subject_identity_id=subject_identity_id,
                 importance=importance,
                 metadata=metadata,
@@ -682,10 +561,64 @@ class PersonaCore:
             if mem_id == "duplicate":
                 logger.debug(f"Memory duplicate detected by MemoryManager for subject {subject_identity_id}")
                 return "duplicate"
+            
+            # --- FIX: Manually update the full record *after* it's created ---
+            # This ensures all fields (like 'source', 'confidence') are saved
+            memory_record = await self.memory_manager.get(mem_id) # Get the full record back
+            if not memory_record:
+                 # This should not happen, but as a safeguard:
+                memory_record = {}
+            
+            memory_record.update({
+                "id": mem_id,
+                "subject_id": subject_identity_id,
+                "user": user_input,
+                "assistant": assistant_response,
+                "source": "assistant_generated", # You can restore your full source logic here
+                "confidence": 0.65, # You can restore your full confidence logic here
+                "verified": False,
+                "timestamp": time.time(),
+                "content_hash": content_hash,
+                "importance": int(max(1, min(5, importance))),
+                "segment": segment,
+                "owner_view": f"User: {user_input} | Assistant: {assistant_response}",
+                "public_view": "A conversation took place regarding a personal topic.",
+                "metadata": {
+                    **(metadata or {}),
+                    "auto_provenance": True,
+                    "intent": intent,
+                    "importance_reason": self._get_importance_reason(user_input, intent or {}, importance)
+                }
+            })
+            await self.memory_manager.put(mem_id, "persona_memory", memory_record)
+            # --- END FIX ---
 
-            # Store the transcript and semantic records
-            await self.memory_manager.append_transcript(subject_identity_id, transcript_entry)
-            await self.memory_manager.append_semantic_entry(subject_identity_id, semantic_record)
+            # 2. Build and store the Transcript Entry
+            transcript_entry = {
+                "id": f"tx_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
+                "memory_id": mem_id, # Use ID from manager
+                "subject_id": subject_identity_id,
+                "user": user_input,
+                "assistant": assistant_response,
+                "timestamp": time.time(),
+                "content_hash": content_hash,
+                "semantic_markers": self._extract_entities(f"{user_input}\n{assistant_response}")
+            }
+            if hasattr(self.memory_manager, "append_transcript"):
+                await self.memory_manager.append_transcript(subject_identity_id, transcript_entry)
+
+            # 3. Build and store the Semantic Record
+            semantic_record = {
+                "id": f"sem_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
+                "memory_id": mem_id, # Use ID from manager
+                "subject_id": subject_identity_id,
+                "summary": (assistant_response[:240] + "...") if assistant_response and len(assistant_response) > 240 else (assistant_response or ""),
+                "entities": transcript_entry.get("semantic_markers", {}),
+                "timestamp": time.time(),
+                "importance": memory_record["importance"],
+            }
+            if hasattr(self.memory_manager, "append_semantic_entry"):
+                await self.memory_manager.append_semantic_entry(subject_identity_id, semantic_record)
                 
             logger.info(f"💾 Dual-memory stored in container '{subject_identity_id}', segment '{segment}' (ID: {mem_id})")
             
@@ -930,22 +863,23 @@ class PersonaCore:
         query = (query or "").strip()
         node_id = f"mem_read_{uuid.uuid4().hex[:6]}"
         link_id = f"link_mem_{node_id}"
+        spawned = False
+        try:
+            if hologram_state is not None:
+                spawned = await self._safe_holo_spawn(node_id, "memory", "Memory Read", 4, "Memory", link_id)
+                if spawned:
+                    await self._safe_holo_set_active("Memory")
+        except Exception:
+            pass # Non-fatal
 
         try:
-            spawned = await self._safe_holo_spawn(node_id, "memory", "Memory Read", 4, "Memory", link_id)
-            if spawned:
-                await self._safe_holo_set_active("Memory")
-
             # --- DELEGATION TO MEMORY MANAGER ---
-            # The MemoryManager handles permission-aware retrieval.
-            # We pass the subject (who the memory is about) and the requester (who is asking).
             memories = await self.memory_manager.retrieve_memories(
                 query_text=query,
                 subject_identity_id=subject_identity_id,
                 requester_id="owner_primary", # The Owner can access all segments
                 limit=limit
             )
-            
             return memories
             
         except Exception as e:
@@ -954,7 +888,7 @@ class PersonaCore:
         
         finally:
             # --- HOLOGRAM CLEANUP (KEPT) ---
-            if hologram_state is not None:
+            if spawned and hologram_state is not None:
                 try:
                     await self._safe_holo_set_idle("Memory")
                     await self._safe_holo_despawn(node_id, link_id)
@@ -1579,33 +1513,9 @@ class PersonaCore:
                     pass
             self._daemon_tasks = []
 
-            # Persist via MemoryManager if available
-            mm = getattr(self, "memory_manager", None)
-            if mm:
-                try:
-                    if hasattr(mm, "save_index"):
-                        maybe = mm.save_index({"memory_index": self.memory_index})
-                        if inspect.iscoroutine(maybe):
-                            await maybe
-                        logger.info("MemoryManager: saved index on PersonaCore.close()")
-                    elif hasattr(mm, "save_persistent_memory"):
-                        maybe = mm.save_persistent_memory()
-                        if inspect.iscoroutine(maybe):
-                            await maybe
-                        logger.info("MemoryManager: invoked save_persistent_memory() on close")
-                    # persist transcript/semantic if supported
-                    if hasattr(mm, "save_transcript_store"):
-                        maybe = mm.save_transcript_store(list(self.transcript_store))
-                        if inspect.iscoroutine(maybe):
-                            await maybe
-                    if hasattr(mm, "save_semantic_index"):
-                        maybe = mm.save_semantic_index(self.semantic_index)
-                        if inspect.iscoroutine(maybe):
-                            await maybe
-                except Exception as e:
-                    logger.warning(f"MemoryManager save on close failed: {e}", exc_info=True)
-            # Local fallback
-            await self.save_persistent_memory()
+            # --- FIX: Removed call to self.save_persistent_memory() ---
+            # Persistence is now handled by main.py calling MemoryManager.save_index()
+            
             await self._persist_critical_data()
             # Clean up expired cache entries
             current_time = time.time()

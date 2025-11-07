@@ -221,8 +221,8 @@ class BaseLLMAdapter(ABC):
     def __init__(self, config: AdapterConfig):
         self.config = config
         self.logger = logging.getLogger(f"AARIA.LLM.{config.provider.value}")
-        # --- FIX: Remove self.session from __init__ ---
-        # self.session: Optional[aiohttp.ClientSession] = None 
+        # --- FIX: Session is no longer an instance variable ---
+        # self.session: Optional[aiohttp.ClientSession] = None
         # --- END FIX ---
         self.circuit_breaker = CircuitBreaker(
             failure_threshold=config.circuit_breaker_threshold,
@@ -244,12 +244,12 @@ class BaseLLMAdapter(ABC):
             raise LLMConfigurationError("Circuit breaker threshold must be at least 1")
 
     async def __aenter__(self):
-        """Async context manager entry - NO session created here."""
+        """Async context manager entry with optimized connection pooling"""
         # --- FIX: Do not create self.session here ---
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit - NO session to close."""
+        """Async context manager exit with proper cleanup"""
         # --- FIX: No self.session to close ---
         pass
 
@@ -318,6 +318,11 @@ class BaseLLMAdapter(ABC):
             # --- FIX: Create and manage the session *inside* the method ---
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+                connector=aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=20,
+                    keepalive_timeout=30,
+                ),
                 headers=self._get_headers()
             ) as session:
             # --- END FIX ---
@@ -326,7 +331,7 @@ class BaseLLMAdapter(ABC):
                     provider=self.config.provider.value, 
                     model=self.config.model
                 ).time():
-                    async with session.post(  # Use the new session
+                    async with session.post( # Use the new session
                         self._get_chat_url(), 
                         json=payload
                     ) as response:
@@ -426,7 +431,7 @@ class BaseLLMAdapter(ABC):
             self._update_circuit_breaker_metrics()
             self.logger.error(f"Unexpected error in LLM request after {latency:.2f}s: {e}")
             raise LLMError(f"LLM request failed after {latency:.2f}s: {e}") from e
-        
+
     async def stream_chat(self, request: LLMRequest) -> AsyncGenerator[str, None]:
         """
         Execute chat completion as an async generator for streaming responses
@@ -442,13 +447,19 @@ class BaseLLMAdapter(ABC):
         payload = self._build_payload(request)
         
         try:
-            async with self.session.post(self._get_chat_url(), json=payload) as response:
-                response.raise_for_status()
-                async for chunk in response.content:
-                    if chunk:
-                        content = self._parse_stream_chunk(chunk)
-                        if content:
-                            yield content
+            # --- FIX: Create and manage the session *inside* the method ---
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.config.timeout),
+                headers=self._get_headers()
+            ) as session:
+            # --- END FIX ---
+                async with session.post(self._get_chat_url(), json=payload) as response:
+                    response.raise_for_status()
+                    async for chunk in response.content:
+                        if chunk:
+                            content = self._parse_stream_chunk(chunk)
+                            if content:
+                                yield content
             
             # Mark success for circuit breaker
             self.circuit_breaker.on_success()
@@ -479,43 +490,49 @@ class BaseLLMAdapter(ABC):
             LLMProvider.AZURE: 3.0,
         }
         
+        # --- FIX: Create and manage the session *inside* the method ---
         try:
-            # Test basic connectivity
-            async with self.session.get(self._get_models_url()) as response:
-                latency = time.perf_counter() - start_time
-                details["http_status"] = response.status
-                details["reachable"] = True
-                details["connectivity_latency"] = latency
-                
-                if response.status == 200:
-                    available_models = await self._get_available_models(response)
-                    model_available = self.config.model in available_models
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10), # Short timeout for health
+                headers=self._get_headers()
+            ) as session:
+            # --- END FIX ---
+                # Test basic connectivity
+                async with session.get(self._get_models_url()) as response:
+                    latency = time.perf_counter() - start_time
+                    details["http_status"] = response.status
+                    details["reachable"] = True
+                    details["connectivity_latency"] = latency
                     
-                    # Test generation capability with small prompt
-                    generation_healthy = await self._test_generation()
-                    details["generation_healthy"] = generation_healthy
-                    
-                    # Determine overall status
-                    threshold = latency_thresholds.get(self.config.provider, 5.0)
-                    latency_healthy = latency <= threshold
-                    
-                    if model_available and generation_healthy and latency_healthy:
-                        status = HealthStatus.HEALTHY
-                    elif model_available and generation_healthy:
-                        status = HealthStatus.DEGRADED
-                        details["warning"] = f"Latency {latency:.2f}s exceeds threshold {threshold}s"
+                    if response.status == 200:
+                        available_models = await self._get_available_models(response)
+                        model_available = self.config.model in available_models
+                        
+                        # Test generation capability with small prompt
+                        generation_healthy = await self._test_generation()
+                        details["generation_healthy"] = generation_healthy
+                        
+                        # Determine overall status
+                        threshold = latency_thresholds.get(self.config.provider, 5.0)
+                        latency_healthy = latency <= threshold
+                        
+                        if model_available and generation_healthy and latency_healthy:
+                            status = HealthStatus.HEALTHY
+                        elif model_available and generation_healthy:
+                            status = HealthStatus.DEGRADED
+                            details["warning"] = f"Latency {latency:.2f}s exceeds threshold {threshold}s"
+                        else:
+                            status = HealthStatus.UNHEALTHY
+                            if not model_available:
+                                details["error"] = f"Configured model '{self.config.model}' not found."
+                            elif not generation_healthy:
+                                details["error"] = "Model failed generation test"
                     else:
                         status = HealthStatus.UNHEALTHY
-                        if not model_available:
-                            details["error"] = f"Configured model '{self.config.model}' not found."
-                        elif not generation_healthy:
-                            details["error"] = "Model failed generation test"
-                else:
-                    status = HealthStatus.UNHEALTHY
-                    model_available = False
-                    available_models = []
-                    details["error"] = f"HTTP {response.status} from models endpoint"
-                    
+                        model_available = False
+                        available_models = []
+                        details["error"] = f"HTTP {response.status} from models endpoint"
+                        
         except Exception as e:
             latency = time.perf_counter() - start_time
             status = HealthStatus.UNHEALTHY

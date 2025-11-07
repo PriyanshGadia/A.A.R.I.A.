@@ -73,10 +73,7 @@ except Exception:
     InboundMessage = None
     create_interaction_core = None
 
-try:
-    from memory_manager import MemoryManager
-except Exception:
-    MemoryManager = None
+from memory_manager import MemoryManager
 
 # Security related (optional)
 try:
@@ -369,9 +366,11 @@ class AARIASystem:
             self.logger.info("Initializing Persona Core...")
             persona = PersonaCore(core=assistant)
             
-            # --- THIS IS THE FIX ---
+            # --- ARCHITECTURAL FIX ---
             # Inject the MemoryManager as the source of truth
             persona.memory_manager = memory_manager
+            # Proactive communicator will be injected later
+            persona.proactive = self.components.get("proactive") 
             # --- END FIX ---
             
             init_m = getattr(persona, "initialize", None)
@@ -385,7 +384,6 @@ class AARIASystem:
             except Exception:
                 pass
             self.components["persona"] = persona
-
         # --- FIX: Inject the (not-yet-created) proactive instance placeholder ---
             # This reference will be populated later, but the attribute must exist.
             persona.proactive = self.components.get("proactive") 
@@ -502,6 +500,16 @@ class AARIASystem:
                         maybe = getattr(proactive, "start", None)
                         if callable(maybe):
                             maybe()
+                    # ... (proactive communicator setup) ...
+                    
+                    # --- FIX: Enable default proactive permissions for owner ---
+                    try:
+                        await proactive.enable_proactive_defaults("owner_primary", channels=["logging", "push"])
+                        self.logger.info("Proactive defaults enabled for owner.")
+                    except Exception:
+                        self.logger.warning("Failed to enable proactive defaults (non-fatal)")
+                    # --- END FIX ---
+
                     self.components["proactive"] = proactive
                     self.logger.info("✅ Proactive communicator started and wired.")
                 except Exception:
@@ -626,33 +634,37 @@ class AARIASystem:
                 self.logger.exception("LLMAdapterFactory cleanup failed (non-fatal)")
 
     # Persona persistence helper (tries several candidate persist methods)
+    # Persona persistence helper (tries several candidate persist methods)
     async def _persist_persona_quick(self) -> bool:
-        persona = self.components.get("persona")
-        if not persona:
-            self.logger.debug("_persist_persona_quick: missing persona")
+        # --- FIX: This method now saves the MEMORY MANAGER ---
+        memory_manager = self.components.get("memory_manager")
+        if not memory_manager:
+            self.logger.debug("_persist_persona_quick: missing memory_manager")
             return False
+            
+        # Try to call the save_index method on MemoryManager
+        candidates = ["save_index", "persist_all", "save"]
         
-        # --- FIX: Removed "close" from this list ---
-        candidates = ["flush_memories", "save_persistent_memory", "persist_memories", "save_all", "save", "persist"]
-        # --- END FIX ---
-
         for name in candidates:
-            if not hasattr(persona, name):
+            if not hasattr(memory_manager, name):
                 continue
-            method = getattr(persona, name)
+            method = getattr(memory_manager, name)
             try:
+                # --- FIX: save_index expects no args ---
                 if inspect.iscoroutinefunction(method):
                     await method()
                 else:
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, method)
-                self.logger.info("Persona quick persist succeeded via '%s'", name)
+                self.logger.info("MemoryManager quick persist succeeded via '%s'", name)
                 return True
             except Exception:
-                self.logger.debug("Persona persist via %s failed (trying next)", name, exc_info=True)
+                self.logger.debug("MemoryManager persist via %s failed (trying next)", name, exc_info=True)
                 await asyncio.sleep(0.05)
-        self.logger.error("Persona quick persist failed (no candidate succeeded)")
+        
+        self.logger.error("MemoryManager quick persist failed (no candidate succeeded)")
         return False
+        # --- END FIX ---
     # ---------------------------
     # CLI Interaction
     # ---------------------------

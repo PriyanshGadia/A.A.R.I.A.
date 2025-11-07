@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
+from secure_store import DB_PATH as DEFAULT_DB_PATH
 # Get the directory where this file (assistant_core.py) is located
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -156,8 +157,7 @@ def _make_store_instance(storage_path: Optional[str] = None):
     """
     if _HAS_EXTERNAL_STORE and ExternalSecureStorageAsync is not None:
         try:
-            # --- THIS IS THE FIX ---
-            # If storage_path is None, call with no args to use the default DB_PATH
+            # --- FIX: If storage_path is None, call with no args to use the default DB_PATH ---
             if storage_path is None:
                 return ExternalSecureStorageAsync()
             # Otherwise, pass the explicit path
@@ -191,8 +191,7 @@ def generate_id(prefix: str = "item") -> str:
 class AssistantCore:
     def __init__(self, password: str, storage_path: Optional[str] = None, auto_recover: bool = True):
         self.password = password
-        # --- FIX: Ensure storage_path defaults to DB_PATH ---
-        from secure_store import DB_PATH as DEFAULT_DB_PATH
+        # --- FIX: Ensure self.storage_path defaults to the actual DB file ---
         self.storage_path = storage_path if storage_path is not None else DEFAULT_DB_PATH
         # --- END FIX ---
         self.auto_recover = auto_recover
