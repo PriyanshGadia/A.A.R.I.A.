@@ -1,1222 +1,1510 @@
-# interaction_core.py
-from __future__ import annotations
-
 """
-A.A.R.I.A Interaction Layer (Async Production v3.0.0 - Agentic Router)
-
-This core is now the "Hands" of the agent. It does not contain any
-intelligence or parsing logic. It does the following:
-1. Identifies the user via SecurityOrchestrator.
-2. Manages the session.
-3. Asks CognitionCore (the "Brain") for a plan.
-4. Executes the plan (calling other cores as tools).
-5. Sends the final result to the user.
+A.A.R.I.A Interaction Core with Enhanced Security & Hologram Integration
+Version: 2.1.0
+Primary module for user interaction processing with security integration.
 """
 
 import asyncio
-import json
 import logging
-import uuid
 import re
-import hashlib
-import hmac
-import base64
 import time
-from typing import Any, Dict, Optional, List, Tuple, Callable
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from contextlib import suppress
+import uuid
+from typing import Dict, List, Optional, Any, Tuple, Callable
+from dataclasses import dataclass, asdict
+from enum import Enum
+import json
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
-# --- [NEW] IMPORTS FOR AGENTIC ROUTER ---
-# These are required for the new executor logic and its fallbacks
-from access_control import SecurityContext, RequestSource, UserIdentity, AccessLevel
-from identity_manager import IdentityProfile
-from autonomy_core import Action, ActionPriority
-from cognition_core import ReasoningMode
-# --- [END NEW IMPORTS] ---
-
-# Optional holo state
-try:
-    import hologram_state  # optional telemetry/holo integration
-except Exception:
-    hologram_state = None
+from security_orchestrator import SecurityOrchestrator
+from cognition_core import CognitionCore
+from identity_manager import IdentityManager
+from security_flow import SecurityFlow
+from autonomy_core import AutonomyCore
+from proactive_comm import ProactiveCommunicator
+from assistant_core import AssistantCore
 
 logger = logging.getLogger("AARIA.Interaction")
 
-# Optional prometheus
-try:
-    from prometheus_client import Counter as PromCounter, Histogram, Gauge, Summary
-    PROMETHEUS_AVAILABLE = True
-except Exception:
-    PROMETHEUS_AVAILABLE = False
+class InteractionState(Enum):
+    INITIALIZING = "initializing"
+    READY = "ready"
+    PROCESSING = "processing"
+    AWAITING_SECURITY = "awaiting_security"
+    SECURITY_REQUIRED = "security_required"
+    MAINTENANCE = "maintenance"
+    SHUTDOWN = "shutdown"
 
-if PROMETHEUS_AVAILABLE:
-    metrics = {
-        "requests_total": PromCounter("interaction_requests_total", "Total interaction requests", ["channel", "intent"]),
-        "responses_total": PromCounter("interaction_responses_total", "Total responses generated", ["channel", "intent", "status"]),
-        "response_latency": Histogram("interaction_response_latency_seconds", "Response latency seconds", ["channel"]),
-        "response_latency_summary": Summary("interaction_response_latency_summary", "Response latency summary", ["channel"]),
-        "active_sessions": Gauge("interaction_active_sessions", "Active conversational sessions"),
-        "queue_size": Gauge("interaction_outbound_queue_size", "Outbound message queue size"),
-        "rate_limited": PromCounter("interaction_rate_limited_total", "Total rate limited events", ["channel"])
-    }
-else:
-    metrics = None
+class CommandType(Enum):
+    NATURAL_LANGUAGE = "natural_language"
+    SECURITY_COMMAND = "security_command"
+    SYSTEM_COMMAND = "system_command"
+    IDENTITY_COMMAND = "identity_command"
+    MEMORY_COMMAND = "memory_command"
+    AUTONOMY_COMMAND = "autonomy_command"
+    PROACTIVE_COMMAND = "proactive_command"
+    ASSISTANT_COMMAND = "assistant_command"
 
-# ---------- Component type placeholders (remains the same) ----------
-try:
-    from persona_core import PersonaCore  # type: ignore
-except Exception:
-    PersonaCore = None  # type: ignore
+class SecurityLevel(Enum):
+    PUBLIC = "public"
+    STANDARD = "standard"
+    ELEVATED = "elevated"
+    HIGH = "high"
+    ROOT = "root"
 
-try:
-    from cognition_core import CognitionCore  # type: ignore
-except Exception:
-    CognitionCore = None  # type: ignore
-
-try:
-    from autonomy_core import AutonomyCore  # type: ignore
-except Exception:
-    AutonomyCore = None  # type: ignore
-
-# ---------- Dataclasses (remains the same) ----------
 @dataclass
-class Session:
+class ParsedCommand:
+    command_type: CommandType
+    intent: str
+    parameters: Dict[str, Any]
+    confidence: float
+    requires_security: bool = False
+    security_level: SecurityLevel = SecurityLevel.STANDARD
+    user_intent: Optional[str] = None
+    context_tags: List[str] = None
+
+@dataclass
+class InteractionSession:
     session_id: str
-    user_id: Optional[str] = None
-    created_at: float = field(default_factory=lambda: time.time())
-    last_active: float = field(default_factory=lambda: time.time())
-    persona_tone: str = "default"
-    history: deque = field(default_factory=lambda: deque(maxlen=200))
-    ttl_seconds: int = 3600
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def touch(self):
-        self.last_active = time.time()
-
-    def is_expired(self) -> bool:
-        return (time.time() - self.last_active) > self.ttl_seconds
+    user_id: str
+    start_time: float
+    device_id: str
+    security_context: Dict[str, Any]
+    message_count: int = 0
+    last_activity: float = None
+    hologram_node_id: str = None
 
 @dataclass
-class InboundMessage:
-    channel: str
-    content: str
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None
-    timestamp: float = field(default_factory=lambda: time.time())
-    metadata: Dict[str, Any] = field(default_factory=dict)
+class HologramState:
+    node_id: str
+    link_id: str
+    state_type: str
+    data: Dict[str, Any]
+    created_at: float
+    updated_at: float
+    ttl: float = 3600  # 1 hour default
 
-@dataclass
-class OutboundMessage:
-    channel: str
-    content: str
-    user_id: Optional[str] = None
-    session_id: Optional[str] = None
-    timestamp: float = field(default_factory=lambda: time.time())
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-# ---------- InteractionCore ----------
-class InteractionCore:
-    DEFAULT_CONFIG = {
-        "session_ttl": 3600,
-        "rate_limit_per_minute": 60,
-        "dedup_window_seconds": 10,
-        "response_cache_ttl": 300,
-        "audit_event_key": "cognition_audit",
-        "autosave_interval": 60,
-        # "max_llm_retries": 3, # <-- Obsolete, moved to CognitionCore/LLMAdapter
-        # "llm_backoff_base": 0.5, # <-- Obsolete
-        "hmac_audit_key": None,
-        "rate_limiter_mode": "sliding",
-        "token_bucket_capacity": 60,
-        "token_bucket_refill_rate_per_minute": 60,
-        # "primary_provider": "groq", # <-- Obsolete, moved to LLMAdapter
-        "proactive_poll_interval": 1.0,
-        "proactive_persist_key": "interaction_proactive_queue_v1",
-        "session_persist_key": "interaction_sessions_v1",
-        "proactive_retry_base": 3.0,
-        "proactive_max_attempts": 5,
-        "allow_proactive_by_default": False,
-    }
-
-    def __init__(self, persona: Any = None, cognition: Any = None, autonomy: Any = None, config: Optional[Dict[str, Any]] = None):
-        # components
-        self.persona = persona
-        self.cognition = cognition
-        self.autonomy = autonomy
-        self.config = {**self.DEFAULT_CONFIG, **(config or {})}
-
-        # security orchestrator
-        try:
-            self.security_orchestrator = self.config.get("security_orchestrator") or (getattr(self.persona, "core", None) and getattr(self.persona.core, "security_orchestrator", None))
-        except Exception:
-            self.security_orchestrator = self.config.get("security_orchestrator", None)
-
-        if self.security_orchestrator:
-            logger.info("🔐 Security orchestrator integrated into InteractionCore")
-        else:
-            logger.warning("⚠️ No security orchestrator provided, running in unsecured mode")
-
-        # state
-        self.sessions: Dict[str, Session] = {}
-        self.outbound_queue: deque = deque()
-        self._session_lock = asyncio.Lock()
-        self._queue_lock = asyncio.Lock()
-        self._rate_lock = asyncio.Lock()
-
-        # dedupe / cache
-        self._recent_requests: Dict[str, float] = {}
-        self._response_cache: Dict[str, Tuple[float, str]] = {}
-
-        # rate-limiting structures
-        self._user_rate_windows: Dict[str, deque] = {}
-        self._token_buckets: Dict[str, Dict[str, float]] = {}
-
-        # --- [DELETED] ---
-        # self.intent_patterns = { ... }
-        # self.privileged_actions = [ ... ]
-        # --- [END DELETED] ---
-
-        # audit logger (optional)
-        self.audit_logger = None
-        try:
-            self.audit_logger = getattr(self.persona.core, "audit_logger", None) if self.persona and hasattr(self.persona, "core") else None
-        except Exception:
-            self.audit_logger = None
-
-        # background control
-        self._stop_event = asyncio.Event()
-        self._background_tasks: List[asyncio.Task] = []
-
-        # proactive persistence + in-memory inflight
-        self._proactive_queue: List[Dict[str, Any]] = []
-        self._proactive_inflight: deque = deque()
-        self._proactive_lock = asyncio.Lock()
-
-        # deliver hook
-        self.deliver_hook: Optional[Callable[[OutboundMessage], Any]] = None
-
-        # persistence bookkeeping
-        self._last_session_persist = 0.0
-        self._last_proactive_persist = 0.0
-
-        logger.info("InteractionCore instance constructed (call await start() to run background workers)")
-
-    # ---------------- Lifecycle (remains the same) ----------------
-    async def start(self):
-        """Start background workers and load persisted state. Caller must await this."""
-        if self._background_tasks:
-            logger.debug("InteractionCore already started")
-            return
-        await self._load_persisted_sessions()
-        await self._load_persisted_proactive_queue()
-        autosave_interval = float(self.config.get("autosave_interval", 60))
-        poll_interval = float(self.config.get("proactive_poll_interval", 1.0))
-        self._stop_event.clear()
-        self._background_tasks.append(asyncio.create_task(self._autosave_worker(autosave_interval)))
-        self._background_tasks.append(asyncio.create_task(self._outbound_worker()))
-        self._background_tasks.append(asyncio.create_task(self._proactive_worker(poll_interval)))
-        logger.info("Async InteractionCore started with %d background tasks", len(self._background_tasks))
-
-    async def stop(self, wait_seconds: float = 5.0):
-        """Stop background workers and persist sessions/proactive queue."""
-        logger.info("InteractionCore stopping")
-        self._stop_event.set()
-        for t in list(self._background_tasks):
-            with suppress(Exception):
-                t.cancel()
-        if self._background_tasks:
-            try:
-                await asyncio.wait(self._background_tasks, timeout=wait_seconds)
-            except Exception:
-                pass
-        self._background_tasks.clear()
-        await self._persist_sessions(force=True)
-        await self._persist_proactive_queue(force=True)
-        logger.info("InteractionCore stopped")
-
-    async def __aenter__(self):
-        await self.start()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.stop()
-
-    # ---------------- Core helpers (remains the same) ----------------
-    def _get_core(self) -> Optional[Any]:
-        """Try to find a core-like object with .store / .notify to integrate with."""
-        for comp in (self.persona, self.cognition, self.autonomy):
-            try:
-                if hasattr(comp, "core"):
-                    return comp.core
-            except Exception:
-                continue
-        for comp in (self.persona, self.cognition, self.autonomy):
-            try:
-                if comp and (hasattr(comp, "save_user_profile") or hasattr(comp, "store")):
-                    return comp
-            except Exception:
-                continue
-        return None
-
-    # ---------------- Persistence: sessions (remains the same) ----------------
-    async def _load_persisted_sessions(self):
-        core = self._get_core()
-        key = self.config.get("session_persist_key", "interaction_sessions_v1")
-        if not core:
-            logger.debug("No core available to load persisted sessions")
-            return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store:
-            logger.debug("No store found on core to load sessions")
-            return
-        try:
-            get = getattr(store, "get", None)
-            maybe = get(key) if get else store.get(key) if hasattr(store, "get") else None
-            data = await maybe if asyncio.iscoroutine(maybe) else maybe
-            if not data or not isinstance(data, dict):
-                logger.debug("No persisted session payload found")
-                return
-            loaded = 0
-            async with self._session_lock:
-                for sid, sess_data in data.items():
-                    if not isinstance(sess_data, dict):
-                        continue
-                    s = Session(
-                        session_id=sid,
-                        user_id=sess_data.get("user_id"),
-                        persona_tone=sess_data.get("persona_tone", "default"),
-                        ttl_seconds=int(self.config.get("session_ttl", 3600)),
-                        created_at=sess_data.get("created_at", time.time())
-                    )
-                    s.last_active = sess_data.get("last_active", s.last_active)
-                    hist = sess_data.get("history", [])
-                    s.history = deque(hist if isinstance(hist, list) else [], maxlen=200)
-                    s.metadata = sess_data.get("metadata", {}) or {}
-                    self.sessions[sid] = s
-                    loaded += 1
-            if PROMETHEUS_AVAILABLE:
-                metrics["active_sessions"].set(len(self.sessions))
-            logger.info("Loaded %d persisted sessions", loaded)
-        except Exception as e:
-            logger.debug("Failed loading persisted sessions: %s", e, exc_info=True)
-
-    async def _persist_sessions(self, force: bool = False):
-        core = self._get_core()
-        key = self.config.get("session_persist_key", "interaction_sessions_v1")
-        if not core:
-            logger.debug("No core available to persist sessions")
-            return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store:
-            logger.debug("No store available to persist sessions")
-            return
-        now = time.time()
-        autosave_interval = float(self.config.get("autosave_interval", 60))
-        if not force and now - self._last_session_persist < max(0.5, autosave_interval / 2):
-            return
-        get_put = getattr(store, "put", None)
-        payload: Dict[str, Any] = {}
-        async with self._session_lock:
-            for sid, sess in list(self.sessions.items()):
-                if sess.is_expired():
-                    continue
-                clean_history = []
-                for h in list(sess.history):
-                    try:
-                        json.dumps(h)
-                        clean_history.append(h)
-                    except Exception:
-                        clean_history.append(str(h))
-                payload[sid] = {
-                    "user_id": sess.user_id,
-                    "created_at": sess.created_at,
-                    "last_active": sess.last_active,
-                    "persona_tone": sess.persona_tone,
-                    "history": clean_history,
-                    "metadata": self._serialize_metadata(sess.metadata),
-                }
-        try:
-            if get_put:
-                try:
-                    maybe = get_put(key, "session_index", payload)
-                except TypeError:
-                    maybe = get_put(key, payload)
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            elif hasattr(store, "__setitem__"):
-                store[key] = payload
-            self._last_session_persist = now
-            logger.debug("Persisted %d sessions", len(payload))
-        except Exception as e:
-            logger.warning("Failed to persist sessions: %s", e, exc_info=True)
-
-    # ---------------- Session APIs (remains the same) ----------------
-    async def create_session(self, user_id: Optional[str] = None, persona_tone: str = "default", ttl_seconds: Optional[int] = None) -> Session:
-        sid = f"sess_{uuid.uuid4().hex[:12]}"
-        ttl = int(ttl_seconds if ttl_seconds is not None else self.config.get("session_ttl", 3600))
-        s = Session(session_id=sid, user_id=user_id, persona_tone=persona_tone, ttl_seconds=ttl)
-        async with self._session_lock:
-            self.sessions[sid] = s
-            if PROMETHEUS_AVAILABLE:
-                metrics["active_sessions"].set(len(self.sessions))
-        logger.debug("Created session %s (user=%s)", sid, user_id)
-        return s
-
-    async def get_session(self, session_id: Optional[str]) -> Optional[Session]:
-        if not session_id:
-            return None
-        async with self._session_lock:
-            s = self.sessions.get(session_id)
-            if not s:
-                return None
-            if s.is_expired():
-                self.sessions.pop(session_id, None)
-                if PROMETHEUS_AVAILABLE:
-                    metrics["active_sessions"].set(len(self.sessions))
-                return None
-            s.touch()
-            return s
-
-    async def end_session(self, session_id: str) -> bool:
-        async with self._session_lock:
-            removed = self.sessions.pop(session_id, None) is not None
-            if PROMETHEUS_AVAILABLE:
-                metrics["active_sessions"].set(len(self.sessions))
-        logger.debug("Ended session %s (removed=%s)", session_id, removed)
-        return removed
-
-    async def cleanup_sessions(self) -> int:
-        removed = 0
-        async with self._session_lock:
-            for sid in list(self.sessions.keys()):
-                if self.sessions[sid].is_expired():
-                    self.sessions.pop(sid, None)
-                    removed += 1
-            if PROMETHEUS_AVAILABLE:
-                metrics["active_sessions"].set(len(self.sessions))
-        logger.debug("Cleaned up %d expired sessions", removed)
-        return removed
-
-    # ---------------- Dedup / Rate limit (remains the same) ----------------
-    def _hash_request(self, inbound: InboundMessage) -> str:
-        key = f"{inbound.user_id}|{inbound.channel}|{inbound.content}"
-        return hashlib.sha256(key.encode()).hexdigest()
-
-    async def _is_duplicate(self, inbound: InboundMessage) -> bool:
-        h = self._hash_request(inbound)
-        now = time.time()
-        last = self._recent_requests.get(h)
-        if last and now - last < float(self.config.get("dedup_window_seconds", 10)):
-            return True
-        self._recent_requests[h] = now
-        cutoff = now - (float(self.config.get("dedup_window_seconds", 10)) * 3)
-        for k, v in list(self._recent_requests.items()):
-            if v < cutoff:
-                self._recent_requests.pop(k, None)
-        return False
-
-    async def _check_rate_limit(self, inbound: InboundMessage) -> Tuple[bool, Optional[str]]:
-        mode = self.config.get("rate_limiter_mode", "sliding")
-        if mode == "token_bucket":
-            user = inbound.user_id or "anon"
-            return await self._token_bucket_check(user)
-        return await self._sliding_window_check(inbound)
-
-    async def _sliding_window_check(self, inbound: InboundMessage) -> Tuple[bool, Optional[str]]:
-        user = inbound.user_id or "anon"
-        limit = int(self.config.get("rate_limit_per_minute", 60))
-        window_seconds = 60
-        now = time.time()
-        async with self._rate_lock:
-            dq = self._user_rate_windows.setdefault(user, deque())
-            while dq and now - dq[0] > window_seconds:
-                dq.popleft()
-            if len(dq) >= limit:
-                if PROMETHEUS_AVAILABLE:
-                    try:
-                        metrics["rate_limited"].labels(inbound.channel).inc()
-                    except Exception:
-                        pass
-                return False, f"Rate limit exceeded: {limit}/minute"
-            dq.append(now)
-        return True, None
-
-    async def _token_bucket_check(self, user: str) -> Tuple[bool, Optional[str]]:
-        cfg = self.config
-        cap = float(cfg.get("token_bucket_capacity", 60))
-        refill_per_min = float(cfg.get("token_bucket_refill_rate_per_minute", 60))
-        refill_per_sec = refill_per_min / 60.0
-        now = time.time()
-        async with self._rate_lock:
-            bucket = self._token_buckets.setdefault(user, {"tokens": cap, "last_refill": now})
-            elapsed = now - bucket["last_refill"]
-            bucket["tokens"] = min(cap, bucket["tokens"] + elapsed * refill_per_sec)
-            bucket["last_refill"] = now
-            if bucket["tokens"] < 1.0:
-                if PROMETHEUS_AVAILABLE:
-                    try:
-                        metrics["rate_limited"].labels("token_bucket").inc()
-                    except Exception:
-                        pass
-                return False, "Rate limit exceeded (token bucket)"
-            bucket["tokens"] -= 1.0
-        return True, None
-
-    # ---------------- Intent & Privilege Helpers (DELETED) ----------------
-    # def classify_intent(self, message: str) -> str: ...
-    # def _contains_privileged_action(self, content: str) -> bool: ...
-    # async def is_privileged(self, ...) -> bool: ...
-
-    # ---------------- LLM helper (DELETED) ----------------
-    # async def _call_llm_with_retries(self, ...) -> str: ...
-
-    # ---------------- Persona prompt & caching (caching remains) ----------------
-    # async def _build_persona_prompt(self, ...) -> List[Dict[str, str]]: ...
+class EnhancedInteractionCore:
+    """
+    Enhanced Interaction Core with deep hologram integration and improved security command handling.
+    Full-featured interaction processing with multi-modal support.
+    """
     
-    def _cache_response(self, request_hash: str, response: str):
-        expiry = time.time() + int(self.config.get("response_cache_ttl", 300))
-        self._response_cache[request_hash] = (expiry, response)
-
-    def _get_cached_response(self, request_hash: str) -> Optional[str]:
-        entry = self._response_cache.get(request_hash)
-        if not entry:
-            return None
-        expiry, response = entry
-        if time.time() > expiry:
-            self._response_cache.pop(request_hash, None)
-            return None
-        return response
-
-    # ---------------- Audit (remains the same) ----------------
-    def _sign_audit_payload(self, payload: Dict[str, Any]) -> Optional[str]:
-        key_b64 = self.config.get("hmac_audit_key")
-        if not key_b64:
-            return None
-        try:
-            key = base64.b64decode(key_b64)
-            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            sig = hmac.new(key, serialized, digestmod=hashlib.sha256).digest()
-            return base64.b64encode(sig).decode("utf-8")
-        except Exception as e:
-            logger.warning("Failed to sign audit payload: %s", e)
-            return None
-
-    async def _audit(self, event: str, request: Dict[str, Any], response: Dict[str, Any], trace_id: Optional[str] = None):
-        def _make_json_safe(obj):
-            if obj is None or isinstance(obj, (str, int, float, bool)):
-                return obj
-            if isinstance(obj, (bytes, bytearray)):
-                return {"__bytes_b64": base64.b64encode(bytes(obj)).decode("ascii")}
-            if isinstance(obj, datetime):
-                try:
-                    return obj.astimezone(timezone.utc).isoformat()
-                except Exception:
-                    return obj.isoformat()
-            if isinstance(obj, dict):
-                return {str(k): _make_json_safe(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple, set, deque)):
-                return [_make_json_safe(x) for x in obj]
-            if hasattr(obj, "__dict__"):
-                try:
-                    return _make_json_safe(vars(obj))
-                except Exception:
-                    return str(obj)
-            try:
-                return json.loads(json.dumps(obj, default=str))
-            except Exception:
-                return str(obj)
-
-        try:
-            payload = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "event": event,
-                "request": request or {},
-                "response": response or {},
-                "trace_id": trace_id or f"trace_{uuid.uuid4().hex[:10]}",
-                "app": "interaction_core",
-                "runtime_ts": int(time.time())
-            }
-            signature = self._sign_audit_payload(payload)
-            if signature:
-                payload["hmac"] = signature
-            safe_obj = _make_json_safe(payload)
-
-            # try audit_logger first
-            try:
-                if self.audit_logger:
-                    ainfo = getattr(self.audit_logger, "ainfo", None)
-                    if ainfo and asyncio.iscoroutinefunction(ainfo):
-                        await ainfo("interaction_audit", extra={"audit": safe_obj})
-                        return safe_obj
-                    if ainfo:
-                        try:
-                            ainfo("interaction_audit", extra={"audit": safe_obj})
-                            return safe_obj
-                        except Exception:
-                            pass
-                    info = getattr(self.audit_logger, "info", None)
-                    if info:
-                        if asyncio.iscoroutinefunction(info):
-                            await info("interaction_audit", extra={"audit": safe_obj})
-                        else:
-                            info("interaction_audit", extra={"audit": safe_obj})
-                        return safe_obj
-            except Exception:
-                logger.debug("Audit logger emission failed (continuing)", exc_info=True)
-
-            # fallback to core.store
-            core = self._get_core()
-            if core:
-                store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-                if store and hasattr(store, "put"):
-                    keyname = f"{self.config.get('audit_event_key','interaction_audit')}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-                    put = getattr(store, "put")
-                    try:
-                        maybe = put(keyname, "interaction_audit", safe_obj)
-                    except TypeError:
-                        maybe = put(keyname, safe_obj)
-                    if asyncio.iscoroutine(maybe):
-                        await maybe
-                    return safe_obj
-
-            # final fallback: compact log
-            try:
-                compact = json.dumps(safe_obj, separators=(",", ":"), ensure_ascii=False)
-                logger.info("AUDIT_FALLBACK: %s", compact)
-                return safe_obj
-            except Exception:
-                logger.warning("Audit final fallback failed")
-                return None
-        except Exception as e:
-            logger.warning("Audit failed unexpectedly: %s", e, exc_info=True)
-            return None
-
-    # ---------------- Security quick path (DELETED) ----------------
-    # async def _process_security_commands_directly(self, ...) -> Optional[OutboundMessage]: ...
-
-    # ---------------- Main inbound processing (UPGRADED) ----------------
-    async def handle_inbound(self, inbound: InboundMessage) -> OutboundMessage:
-        """
-        [UPGRADED]
-        This handler is now streamlined. All messages, whether chat or command,
-        are sent to _process_normal_message, which contains the new agentic router.
-        """
-        # The old logic for a separate security path is GONE.
-        # All messages are processed intelligently.
-        return await self._process_normal_message(inbound)
-
-    async def _process_normal_message(self, inbound: InboundMessage) -> OutboundMessage:
-        """
-        [UPGRADED]
-        This method is now the core "Executor" for the Agentic Router.
-        It gets a plan from CognitionCore and executes the specified tool calls.
-        """
-        trace_id = f"trace_{uuid.uuid4().hex[:10]}"
-        request_hash = self._hash_request(inbound)
-        node_id = f"input_{trace_id}"
-        link_id = f"link_{node_id}"
-
-        # optional hologram spawn
-        if hologram_state is not None:
-            try:
-                spawn = getattr(hologram_state, "spawn_and_link", None)
-                if callable(spawn):
-                    r = spawn(node_id=node_id, node_type="input", label=f"Input: {inbound.content[:20]}...", size=5, source_id="PersonaCore", link_id=link_id)
-                    if asyncio.iscoroutine(r):
-                        await r
-                s = getattr(hologram_state, "set_node_active", None)
-                if callable(s):
-                    r2 = s("PersonaCore")
-                    if asyncio.iscoroutine(r2):
-                        await r2
-            except Exception:
-                logger.debug("Hologram spawn failed (non-fatal)")
-
-        try:
-            # dedup
-            if await self._is_duplicate(inbound):
-                cached = self._get_cached_response(request_hash)
-                if cached:
-                    resp = OutboundMessage(channel=inbound.channel, content=cached, user_id=inbound.user_id, session_id=inbound.session_id)
-                    await self._audit("reason_cached", {"query": inbound.content, "context": inbound.metadata}, {"response": cached}, trace_id)
-                    return resp
-
-            # rate limit
-            ok, reason = await self._check_rate_limit(inbound)
-            if not ok:
-                fallback = await self._get_rate_limit_fallback(inbound.content)
-                out = OutboundMessage(channel=inbound.channel, content=fallback, user_id=inbound.user_id, session_id=inbound.session_id)
-                await self._audit("rate_limited", {"query": inbound.content, "reason": reason}, {"response": fallback}, trace_id)
-                return out
-
-            # --- [SECURITY FLOW] ---
-            # Security flow is STILL ESSENTIAL. It runs *before* cognition
-            # to establish the identity and context for the "Brain."
-            security_context = None
-            identity_profile = None
-            if self.security_orchestrator:
-                try:
-                    request_data = {
-                        "query": inbound.content,
-                        "user_id": inbound.user_id,
-                        "source": inbound.channel,
-                        "device_id": inbound.metadata.get("device_id", "unknown"),
-                        "session_token": inbound.metadata.get("session_token"),
-                        "biometric_data": inbound.metadata.get("biometric_data"),
-                        "behavior_profile": inbound.metadata.get("behavior_profile"),
-                        "user_name": inbound.metadata.get("user_name")
-                    }
-                    if hasattr(self.security_orchestrator, "process_security_flow_enhanced"):
-                        res = await self.security_orchestrator.process_security_flow_enhanced(request_data)
-                    elif hasattr(self.security_orchestrator, "process_security_flow"):
-                        res = await self.security_orchestrator.process_security_flow(request_data)
-                    else:
-                        res = (None, None) # Fallback
-
-                    if isinstance(res, tuple) and len(res) >= 2:
-                        security_context, identity_profile = res[0], res[1]
-                    else:
-                        security_context = getattr(res, "security_context", None)
-                        identity_profile = getattr(res, "identity_profile", None)
-
-                except Exception as e:
-                    logger.error("Security processing error: %s", e, exc_info=True)
-                    # Create a fallback identity so the system can still respond
-                    identity_profile = IdentityProfile(identity_id="public_fallback", name="User", preferred_name="User", relationship="public")
-                    security_context = SecurityContext(request_source=RequestSource.PUBLIC_API, user_identity=UserIdentity(user_id="public_fallback", name="User", access_level=AccessLevel.PUBLIC, privileges=set()), requested_data_categories=[])
-            else:
-                # Fallback if no security orchestrator at all
-                identity_profile = IdentityProfile(identity_id=inbound.user_id or "public_default", name="User", preferred_name="User", relationship="public")
-                security_context = SecurityContext(request_source=RequestSource.PUBLIC_API, user_identity=UserIdentity(user_id=inbound.user_id or "public_default", name="User", access_level=AccessLevel.PUBLIC, privileges=set()), requested_data_categories=[])
-
-
-            # session resolution
-            session = await self.get_session(inbound.session_id) if inbound.session_id else None
-            if not session:
-                session = await self.create_session(user_id=inbound.user_id)
-                inbound.session_id = session.session_id
-
-            # Store the identified user's context in the session
-            if security_context and identity_profile:
-                session.metadata["security_context"] = security_context
-                session.metadata["identity"] = identity_profile
-                session.metadata["preferred_name"] = getattr(identity_profile, "preferred_name", None)
-
-            # --- [AGENTIC ROUTER: THINK -> PLAN -> ACT] ---
-            start = time.time()
-
-            # 1. THINK (Call CognitionCore to get the plan)
-            if not self.cognition:
-                 return OutboundMessage(channel=inbound.channel, content="CognitionCore is offline.", user_id=inbound.user_id, session_id=inbound.session_id)
-
-            # Pass the *full* security context to the brain
-            cognition_context = {"security": security_context, "identity": identity_profile}
-            
-            # This is the query to the "Brain"
-            execution_plan = await self.cognition.reason(
-                inbound.content, # Pass the original, natural language query
-                context=cognition_context, 
-                reasoning_mode=ReasoningMode.BALANCED 
-            )
-
-            latency = time.time() - start
-            final_response_text = "Task executed." # Default response, will be overwritten
-            plan_succeeded = True
-
-            # 2. ACT (Execute the plan)
-            if not execution_plan:
-                 execution_plan = [{"tool_name": "chat_response", "params": {"response_text": "I'm not sure how to respond to that."}}]
-
-            # Loop over all steps in the plan (usually just one, but supports multi-step)
-            for step in execution_plan:
-                tool_name = step.get("tool_name")
-                params = step.get("params", {})
-
-                if tool_name == "security_command":
-                    command = params.get("command", "")
-                    if not command:
-                        final_response_text = "❌ Cognitive error: security_command was empty."
-                        plan_succeeded = False
-                    elif not self.security_orchestrator:
-                        final_response_text = "❌ Security system is offline."
-                        plan_succeeded = False
-                    else:
-                        # Execute the security command and get the string response
-                        # This re-uses all your existing, robust security logic!
-                        final_response_text = await self.security_orchestrator.process_security_command(
-                            command, params, identity_profile # Pass the identified identity
-                        )
-                
-                elif tool_name == "autonomy_action":
-                    action_type = params.get("action_type")
-                    details = params.get("details", {})
-                    if not action_type or not self.autonomy:
-                        final_response_text = f"❌ Autonomy system is offline or action type was missing."
-                        plan_succeeded = False
-                    else:
-                        # Persist a short memory record about the requested action so
-                        # important user-provided data (like contact names, birthdays)
-                        # are searchable immediately even if the autonomous action runs
-                        # separately.
-                        try:
-                            if hasattr(self, "persona") and hasattr(self.persona, "store_memory"):
-                                user_desc = f"Requested action: {action_type} - {details.get('title') or details.get('name') or details.get('q') or ''}"
-                                assistant_desc = json.dumps({"action_request_details": details}, default=str)
-                                maybe = self.persona.store_memory(user_desc, assistant_desc, importance=3, metadata={"source":"interaction","action_type":action_type}, subject_identity_id=getattr(self.persona, 'session_identity_id', 'owner_primary'))
-                                if asyncio.iscoroutine(maybe):
-                                    await maybe
-                        except Exception:
-                            logger.debug("Failed to pre-persist autonomy action details to persona memory (non-fatal)")
-
-                        # Enqueue the action for AutonomyCore to handle
-                        # This correctly fixes the "Yash's birthday" reminder flow
-                        await self.autonomy.enqueue_action(
-                            Action(action_type=action_type, details=details, priority=ActionPriority.NORMAL.value)
-                        )
-                        final_response_text = f"✅ Task '{action_type}' has been scheduled."
-
-                elif tool_name == "chat_response":
-                    final_response_text = params.get("response_text", "[No response]")
-                
-                else:
-                    final_response_text = f"❌ Unknown tool specified by Cognition: {tool_name}"
-                    plan_succeeded = False
-
-            # --- [END OF AGENTIC ROUTER] ---
-
-            # 3. RESPOND (Finalize and send the result to the user)
-            preferred_name = "User"
-            if identity_profile and getattr(identity_profile, "preferred_name", None):
-                preferred_name = identity_profile.preferred_name
-            elif session and session.metadata.get("preferred_name"):
-                preferred_name = session.metadata.get("preferred_name")
-
-            # Personalize the *final* response string
-            try:
-                if preferred_name != "User":
-                    # Check for owner/privileged level before replacing "Owner"
-                    access_level = getattr(getattr(security_context, "user_identity", None), "access_level", AccessLevel.PUBLIC)
-                    if access_level in (AccessLevel.OWNER_ROOT, AccessLevel.OWNER_REMOTE):
-                        final_response_text = final_response_text.replace("Owner", preferred_name)
-                    final_response_text = final_response_text.replace("User", preferred_name)
-            except Exception:
-                pass # Non-fatal
-
-            if PROMETHEUS_AVAILABLE:
-                try:
-                    metrics["response_latency"].labels(inbound.channel).observe(latency)
-                    metrics["response_latency_summary"].labels(inbound.channel).observe(latency)
-                    # We can get the intent from the plan now!
-                    intent_from_plan = execution_plan[0].get("tool_name", "unknown")
-                    metrics["requests_total"].labels(inbound.channel, intent_from_plan).inc()
-                    status_label = "success" if plan_succeeded else "failure"
-                    metrics["responses_total"].labels(inbound.channel, intent_from_plan, status_label).inc()
-                except Exception:
-                    pass
-
-            safe = final_response_text.strip()
-            self._cache_response(request_hash, safe) # Cache the final string
-
-            # record history
-            sec_level = "unknown"
-            try:
-                if security_context and getattr(security_context, "user_identity", None):
-                    al = security_context.user_identity.access_level
-                    sec_level = getattr(al, "value", None) or getattr(al, "name", None) or str(al)
-            except Exception:
-                sec_level = "unknown"
-                
-            session.history.append({"role": "user", "content": inbound.content, "ts": inbound.timestamp, "security_level": sec_level})
-            session.history.append({"role": "assistant", "content": safe, "ts": time.time(), "personalized_for": preferred_name})
-            session.touch()
-
-            try:
-                asyncio.create_task(self._persist_sessions())
-            except Exception:
-                await self._persist_sessions()
-
-            # The old _interpret_and_execute_actions call is no longer needed.
-            # (DELETED)
-
-            out = OutboundMessage(channel=inbound.channel, content=safe, user_id=inbound.user_id, session_id=session.session_id, metadata={
-                "security_level": sec_level,
-                "personalized": preferred_name != "User",
-                "response_latency": latency,
-                "executed_plan": execution_plan # Add plan to metadata for debugging
-            })
-
-            await self._audit("intent_executed", {"query": inbound.content, "plan": execution_plan}, {"response": safe, "latency": latency, "personalized_for": preferred_name}, trace_id)
-            await self.send_outbound(out)
-            return out
-
-        except Exception as e:
-            logger.exception("Unhandled error in _process_normal_message: %s", e)
-            return OutboundMessage(channel=inbound.channel, content="I encountered an error while processing your message. See logs.", user_id=inbound.user_id, session_id=inbound.session_id)
+    def __init__(self, 
+                 security_orchestrator: SecurityOrchestrator, 
+                 cognition_core: CognitionCore,
+                 autonomy_core: Optional[AutonomyCore] = None,
+                 proactive_communicator: Optional[ProactiveCommunicator] = None,
+                 assistant_core: Optional[AssistantCore] = None):
         
-        finally:
-            # hologram cleanup
-            if hologram_state is not None:
-                try:
-                    sfun = getattr(hologram_state, "set_node_idle", None)
-                    if callable(sfun):
-                        r = sfun("PersonaCore")
-                        if asyncio.iscoroutine(r):
-                            await r
-                    despawn = getattr(hologram_state, "despawn_and_unlink", None)
-                    if callable(despawn):
-                        r2 = despawn(node_id, link_id)
-                        if asyncio.iscoroutine(r2):
-                            await r2
-                except Exception:
-                    logger.debug("Hologram cleanup failed (non-fatal)")
-
-    # ---------------- Proactive enqueue / persistence (remains the same) ----------------
-    async def _enqueue_proactive(self, subject_identity: str, channel: str, payload: Dict[str, Any], deliver_after: float):
-        envelope = {
-            "id": f"pmsg_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-            "subject_identity": subject_identity,
-            "channel": channel,
-            "payload": payload,
-            "created_at": time.time(),
-            "deliver_after": float(deliver_after),
-            "attempts": 0,
-            "max_attempts": int(self.config.get("proactive_max_attempts", 5)),
-            "last_error": None
+        self.security_orchestrator = security_orchestrator
+        self.cognition_core = cognition_core
+        self.autonomy_core = autonomy_core
+        self.proactive_communicator = proactive_communicator
+        self.assistant_core = assistant_core
+        
+        self.identity_manager = security_orchestrator.identity_manager
+        self.security_flow = SecurityFlow(security_orchestrator)
+        
+        self.state = InteractionState.INITIALIZING
+        self.workers = []
+        self.is_running = False
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        
+        # Session management
+        self.active_sessions: Dict[str, InteractionSession] = {}
+        self.session_timeout = 1800  # 30 minutes
+        
+        # Enhanced command patterns
+        self.security_patterns = self._initialize_security_patterns()
+        self.command_handlers = self._initialize_command_handlers()
+        
+        # Hologram integration
+        self.active_holograms: Dict[str, HologramState] = {}
+        self.hologram_states: Dict[str, Any] = {}
+        
+        # Statistics and monitoring
+        self.interaction_stats = {
+            "total_messages": 0,
+            "successful_responses": 0,
+            "failed_responses": 0,
+            "security_blocks": 0,
+            "avg_response_time": 0.0,
+            "session_count": 0
         }
-        async with self._proactive_lock:
-            self._proactive_queue.append(envelope)
-            if envelope["deliver_after"] <= time.time():
-                self._proactive_inflight.append(envelope)
+        
+        # Rate limiting
+        self.rate_limits: Dict[str, List[float]] = {}
+        self.max_requests_per_minute = 60
+        
+        # Context management
+        self.conversation_context: Dict[str, Any] = {}
+        
+        logger.info("InteractionCore instance constructed (call await start() to run background workers)")
+    
+    def _initialize_security_patterns(self) -> Dict[str, List[str]]:
+        """Initialize comprehensive security and command patterns"""
+        return {
+            'identity_set_name': [
+                r'(?:call me|address me as|my name is|remember me as)\s+([^\.,!?]+)',
+                r'(?:set.*name.*to|change.*name.*to)\s+([^\.,!?]+)',
+                r'(?:i am|i\'m)\s+([^\.,!?]+)(?!\s+(?:sorry|tired|busy|happy|sad))',
+                r'(?:you can call me|you may address me as)\s+([^\.,!?]+)',
+                r'(?:from now on call me|please call me)\s+([^\.,!?]+)'
+            ],
+            'identity_preferences': [
+                r'(?:my birthday is|i was born on|born on|birthdate.*is)\s+([^\.,!?]+)',
+                r'(?:remember my birthday|store my birthday|my birthday)',
+                r'(?:february\s+29|29 feb|feb\s+29|leap day)',
+                r'(?:my favorite|i like|i prefer|i enjoy)\s+([^\.,!?]+)',
+                r'(?:remember that i|note that i)\s+([^\.,!?]+)'
+            ],
+            'identity_query': [
+                r'who am i',
+                r'what is my name',
+                r'what do you know about me',
+                r'what is my birthday',
+                r'when is my birthday',
+                r'my birthdate',
+                r'tell me about myself',
+                r'what are my preferences'
+            ],
+            'security_status': [
+                r'security status',
+                r'system status',
+                r'show security',
+                r'access level',
+                r'my permissions',
+                r'security report'
+            ],
+            'autonomy_control': [
+                r'(?:start|enable|activate).*autonomy',
+                r'(?:stop|disable|deactivate).*autonomy',
+                r'autonomy status',
+                r'autonomous mode',
+                r'background tasks'
+            ],
+            'memory_operations': [
+                r'remember that',
+                r'forget that',
+                r'recall when',
+                r'what did we talk about',
+                r'clear memory',
+                r'memory status'
+            ],
+            'proactive_requests': [
+                r'remind me',
+                r'schedule.*message',
+                r'send.*notification',
+                r'alert me when',
+                r'notify me about'
+            ],
+            'assistant_commands': [
+                r'assistant mode',
+                r'enable assistant',
+                r'task completion',
+                r'help me with',
+                r'assist with'
+            ]
+        }
+    
+    def _initialize_command_handlers(self) -> Dict[str, Callable]:
+        """Initialize command handler mappings"""
+        return {
+            'identity_set_name': self._handle_identity_set_name,
+            'identity_preferences': self._handle_identity_preferences,
+            'identity_query': self._handle_identity_query,
+            'security_status': self._handle_security_status,
+            'autonomy_control': self._handle_autonomy_control,
+            'memory_operations': self._handle_memory_operations,
+            'proactive_requests': self._handle_proactive_requests,
+            'assistant_commands': self._handle_assistant_commands
+        }
+    
+    async def start(self):
+        """Start the interaction core with all background workers"""
+        if self.is_running:
+            logger.warning("InteractionCore already running")
+            return
+        
+        self.state = InteractionState.INITIALIZING
+        
         try:
-            asyncio.create_task(self._persist_proactive_queue())
-        except Exception:
-            await self._persist_proactive_queue()
-
-    async def _persist_proactive_queue(self, force: bool = False):
-        core = self._get_core()
-        key = self.config.get("proactive_persist_key", "interaction_proactive_queue_v1")
-        if not core:
-            return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store:
-            return
-        now_ts = time.time()
-        if not force and now_ts - self._last_proactive_persist < 1.0:
-            return
-        try:
-            put = getattr(store, "put", None)
-            payload = {"queue": list(self._proactive_queue), "ts": now_ts}
-            if put:
-                try:
-                    maybe = put(key, "proactive", payload)
-                except TypeError:
-                    maybe = put(key, payload)
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            elif hasattr(store, "__setitem__"):
-                store[key] = payload
-            self._last_proactive_persist = now_ts
-            logger.debug("Persisted proactive queue (count=%d)", len(self._proactive_queue))
+            # Initialize all subsystems
+            await self._initialize_hologram_states()
+            await self._initialize_session_cleanup()
+            await self._initialize_context_manager()
+            
+            # Start background workers
+            workers = [
+                self._background_worker(),
+                self._session_cleanup_worker(),
+                self._hologram_maintenance_worker(),
+                self._stats_monitoring_worker()
+            ]
+            
+            for worker in workers:
+                task = asyncio.create_task(worker)
+                self.workers.append(task)
+            
+            self.state = InteractionState.READY
+            self.is_running = True
+            
+            logger.info("🔐 Security orchestrator integrated into InteractionCore")
+            logger.info("InteractionCore started with %d background workers", len(workers))
+            
         except Exception as e:
-            logger.exception("Failed to persist proactive queue: %s", e)
-
-    async def _load_persisted_proactive_queue(self):
-        core = self._get_core()
-        key = self.config.get("proactive_persist_key", "interaction_proactive_queue_v1")
-        if not core:
-            logger.debug("No core to load proactive queue from")
-            return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store:
-            logger.debug("No store available to load proactive queue")
-            return
+            logger.error("Failed to start InteractionCore: %s", e)
+            self.state = InteractionState.SHUTDOWN
+            raise
+    
+    async def stop(self):
+        """Stop the interaction core and all workers gracefully"""
+        self.state = InteractionState.SHUTDOWN
+        self.is_running = False
+        
         try:
-            get = getattr(store, "get", None)
-            maybe = get(key) if get else store.get(key) if hasattr(store, "get") else None
-            data = await maybe if asyncio.iscoroutine(maybe) else maybe
-            if data and isinstance(data, dict) and "queue" in data:
-                async with self._proactive_lock:
-                    self._proactive_queue = data.get("queue", []) or []
-                    now = time.time()
-                    for env in list(self._proactive_queue):
-                        if env.get("deliver_after", 0) <= now:
-                            self._proactive_inflight.append(env)
-                logger.info("Loaded persisted proactive queue (count=%d)", len(self._proactive_queue))
+            # Cancel all workers
+            for worker in self.workers:
+                if not worker.done():
+                    worker.cancel()
+            
+            # Wait for workers to complete
+            if self.workers:
+                await asyncio.gather(*self.workers, return_exceptions=True)
+            
+            # Clean up resources
+            await self._cleanup_holograms()
+            await self._cleanup_sessions()
+            self.thread_pool.shutdown(wait=True)
+            
+            self.workers.clear()
+            logger.info("InteractionCore stopped gracefully")
+            
         except Exception as e:
-            logger.exception("Failed to load persisted proactive queue: %s", e)
-
-    # ---------------- Proactive worker (remains the same) ----------------
-    async def _proactive_worker(self, poll_interval: float = 1.0):
-        retry_base = float(self.config.get("proactive_retry_base", 3.0))
-        max_attempts = int(self.config.get("proactive_max_attempts", 5))
-        while not self._stop_event.is_set():
-            try:
-                now = time.time()
-                async with self._proactive_lock:
-                    self._proactive_queue.sort(key=lambda e: e.get("deliver_after", 0))
-                    while self._proactive_queue and self._proactive_queue[0].get("deliver_after", 0) <= now:
-                        env = self._proactive_queue.pop(0)
-                        self._proactive_inflight.append(env)
-
-                if self._proactive_inflight:
-                    env = self._proactive_inflight.popleft()
-                    try:
-                        out = OutboundMessage(channel=env.get("channel", "push"), content=env.get("payload", {}).get("text", ""), user_id=env.get("subject_identity"))
-                        delivered = await self._deliver_message_async(out)
-                        env["attempts"] = env.get("attempts", 0) + 1
-                        if delivered:
-                            await self._audit("proactive_sent", {"envelope_id": env.get("id"), "payload_preview": str(env.get("payload", {}))[:120]}, {"status": "delivered"})
-                            async with self._proactive_lock:
-                                self._proactive_queue = [e for e in self._proactive_queue if e.get("id") != env.get("id")]
-                            await self._persist_proactive_queue()
-                        else:
-                            env["last_error"] = "delivery_failed"
-                            if env.get("attempts", 0) >= max_attempts:
-                                await self._audit("proactive_failed_final", {"envelope_id": env.get("id")}, {"status": "final_failure"})
-                                async with self._proactive_lock:
-                                    self._proactive_queue = [e for e in self._proactive_queue if e.get("id") != env.get("id")]
-                                await self._persist_proactive_queue()
-                            else:
-                                backoff = retry_base * (2 ** (env["attempts"] - 1))
-                                env["deliver_after"] = time.time() + backoff + (0.5 * (uuid.uuid4().int & 0xff) / 255.0)
-                                async with self._proactive_lock:
-                                    self._proactive_queue.append(env)
-                                await self._persist_proactive_queue()
-                                await self._audit("proactive_retry_scheduled", {"envelope_id": env.get("id"), "next_attempt_at": env["deliver_after"]}, {"attempts": env["attempts"]})
-                    except Exception as e:
-                        logger.exception("Proactive delivery error: %s", e)
-                        env["attempts"] = env.get("attempts", 0) + 1
-                        env["last_error"] = str(e)
-                        if env.get("attempts", 0) >= max_attempts:
-                            await self._audit("proactive_failed_final", {"envelope_id": env.get("id")}, {"status": "final_failure", "error": str(e)})
-                            async with self._proactive_lock:
-                                self._proactive_queue = [e for e in self._proactive_queue if e.get("id") != env.get("id")]
-                            await self._persist_proactive_queue()
-                        else:
-                            backoff = retry_base * (2 ** (env["attempts"] - 1))
-                            env["deliver_after"] = time.time() + backoff
-                            async with self._proactive_lock:
-                                self._proactive_queue.append(env)
-                            await self._persist_proactive_queue()
+            logger.error("Error during InteractionCore shutdown: %s", e)
+    
+    async def process_message(self, 
+                            message: str, 
+                            user_context: Dict[str, Any] = None,
+                            session_id: str = None) -> str:
+        """
+        Process a user message with enhanced security and hologram integration
+        
+        Args:
+            message: User message to process
+            user_context: User identity and context information
+            session_id: Optional session ID for continuous conversation
+            
+        Returns:
+            Response message
+        """
+        if self.state != InteractionState.READY:
+            return "System is not ready. Please wait for initialization."
+        
+        start_time = time.time()
+        self.state = InteractionState.PROCESSING
+        
+        try:
+            # Rate limiting check
+            if not await self._check_rate_limit(user_context):
+                return "Rate limit exceeded. Please wait a moment."
+            
+            # Get or create session
+            session = await self._get_or_create_session(session_id, user_context)
+            
+            # Parse command with enhanced security awareness
+            parsed_command = await self._parse_command(message, user_context, session)
+            
+            # Process through security flow
+            security_context = await self.security_flow.process_request(
+                request_type="user_interaction",
+                user_identity=session.user_id,
+                source_device=session.device_id,
+                data_categories=parsed_command.parameters.get('data_categories', ['conversation'])
+            )
+            
+            # Update session context
+            session.security_context = security_context
+            session.message_count += 1
+            session.last_activity = time.time()
+            
+            # Handle command based on type
+            response = await self._route_command(parsed_command, security_context, session)
+            
+            # Update statistics
+            await self._update_interaction_stats(start_time, True)
+            
+            # Update hologram states
+            await self._update_interaction_hologram(parsed_command, security_context, session)
+            
+            return response
+            
+        except Exception as e:
+            logger.error("Error processing message: %s", e)
+            await self._update_interaction_stats(start_time, False)
+            return f"I encountered an error processing your request: {str(e)}"
+        finally:
+            self.state = InteractionState.READY
+    
+    async def _get_or_create_session(self, session_id: str, user_context: Dict[str, Any]) -> InteractionSession:
+        """Get existing session or create new one"""
+        if session_id and session_id in self.active_sessions:
+            session = self.active_sessions[session_id]
+            session.last_activity = time.time()
+            return session
+        
+        # Create new session
+        new_session_id = session_id or f"session_{uuid.uuid4().hex[:8]}"
+        user_id = user_context.get('user_id', 'unknown')
+        device_id = user_context.get('device_id', 'cli_terminal')
+        
+        session = InteractionSession(
+            session_id=new_session_id,
+            user_id=user_id,
+            start_time=time.time(),
+            device_id=device_id,
+            security_context={},
+            hologram_node_id=f"session_{new_session_id}"
+        )
+        
+        self.active_sessions[new_session_id] = session
+        self.interaction_stats["session_count"] += 1
+        
+        # Create session hologram
+        await self._create_session_hologram(session)
+        
+        return session
+    
+    async def _parse_command(self, 
+                           message: str, 
+                           user_context: Dict[str, Any],
+                           session: InteractionSession) -> ParsedCommand:
+        """
+        Enhanced command parsing with security intent recognition and context awareness
+        """
+        message_lower = message.lower().strip()
+        
+        # Check for system commands first
+        system_command = await self._detect_system_command(message_lower)
+        if system_command:
+            return system_command
+        
+        # Check for identity commands
+        identity_command = await self._detect_identity_command(message_lower, session)
+        if identity_command:
+            return identity_command
+        
+        # Check for other command types
+        for command_type, patterns in self.security_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, message_lower, re.IGNORECASE):
+                    handler = self.command_handlers.get(command_type)
+                    if handler:
+                        return await self._create_command_from_pattern(
+                            command_type, message, pattern, user_context)
+        
+        # Default to natural language processing with context
+        return await self._create_natural_language_command(message, user_context, session)
+    
+    async def _detect_system_command(self, message: str) -> Optional[ParsedCommand]:
+        """Detect system-level commands"""
+        system_commands = {
+            'exit': ("system_exit", {"action": "shutdown"}),
+            'quit': ("system_exit", {"action": "shutdown"}),
+            'stop': ("system_exit", {"action": "shutdown"}),
+            'status': ("system_status", {"action": "status_check"}),
+            'health': ("system_health", {"action": "health_check"}),
+            'help': ("system_help", {"action": "show_help"}),
+            'stats': ("system_stats", {"action": "show_stats"}),
+            'restart': ("system_restart", {"action": "restart"}),
+            'clear': ("system_clear", {"action": "clear_context"})
+        }
+        
+        for cmd, (intent, params) in system_commands.items():
+            if message == cmd:
+                return ParsedCommand(
+                    command_type=CommandType.SYSTEM_COMMAND,
+                    intent=intent,
+                    parameters=params,
+                    confidence=1.0
+                )
+        
+        return None
+    
+    async def _detect_identity_command(self, message: str, session: InteractionSession) -> Optional[ParsedCommand]:
+        """Detect identity-related commands with context awareness"""
+        
+        # Name setting with improved context
+        name_match = await self._extract_name_from_message(message)
+        if name_match:
+            name, confidence = name_match
+            return ParsedCommand(
+                command_type=CommandType.IDENTITY_COMMAND,
+                intent="set_preferred_name",
+                parameters={"name": name, "action": "identity_update"},
+                confidence=confidence,
+                requires_security=True,
+                security_level=SecurityLevel.HIGH
+            )
+        
+        # Birthday and preferences
+        birthday_match = await self._extract_birthday_from_message(message)
+        if birthday_match:
+            birthday, confidence = birthday_match
+            return ParsedCommand(
+                command_type=CommandType.IDENTITY_COMMAND,
+                intent="set_birthday",
+                parameters={"birthday": birthday, "action": "identity_update"},
+                confidence=confidence,
+                requires_security=True,
+                security_level=SecurityLevel.HIGH
+            )
+        
+        # Identity queries
+        if await self._is_identity_query(message):
+            return ParsedCommand(
+                command_type=CommandType.IDENTITY_COMMAND,
+                intent="get_identity",
+                parameters={"action": "identity_query", "session_context": session.security_context},
+                confidence=0.9,
+                requires_security=True,
+                security_level=SecurityLevel.STANDARD
+            )
+        
+        return None
+    
+    async def _extract_name_from_message(self, message: str) -> Optional[Tuple[str, float]]:
+        """Extract name from message with confidence scoring"""
+        name_patterns = [
+            (r'(?:call me|address me as)\s+([^\.,!?]+)', 0.95),
+            (r'(?:my name is|i am|i\'m)\s+([^\.,!?]+)(?!\s+(?:sorry|tired))', 0.9),
+            (r'(?:you can call me|you may address me as)\s+([^\.,!?]+)', 0.98),
+            (r'(?:set.*name.*to|change.*name.*to)\s+([^\.,!?]+)', 0.85)
+        ]
+        
+        for pattern, confidence in name_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Clean up the name
+                name = re.sub(r'^(?:as|me|your)\s+', '', name, flags=re.IGNORECASE)
+                if len(name) > 1 and len(name) < 50:  # Basic validation
+                    return name, confidence
+        
+        return None
+    
+    async def _extract_birthday_from_message(self, message: str) -> Optional[Tuple[str, float]]:
+        """Extract birthday from message with confidence scoring"""
+        birthday_patterns = [
+            (r'(?:my birthday is|i was born on)\s+([^\.,!?]+)', 0.9),
+            (r'(?:born on|birthdate.*is)\s+([^\.,!?]+)', 0.85),
+            (r'(?:february\s+29|29\s+feb|feb\s+29)', 0.8),  # Leap day
+            (r'\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?)\b', 0.7)
+        ]
+        
+        for pattern, confidence in birthday_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                birthday = match.group(1).strip()
+                return birthday, confidence
+        
+        return None
+    
+    async def _is_identity_query(self, message: str) -> bool:
+        """Check if message is an identity query"""
+        query_patterns = [
+            r'who am i',
+            r'what is my name',
+            r'what do you know about me',
+            r'what is my birthday',
+            r'when is my birthday',
+            r'my birthdate',
+            r'tell me about myself',
+            r'what are my preferences'
+        ]
+        
+        return any(re.search(pattern, message, re.IGNORECASE) for pattern in query_patterns)
+    
+    async def _create_command_from_pattern(self, 
+                                         command_type: str, 
+                                         message: str, 
+                                         pattern: str,
+                                         user_context: Dict[str, Any]) -> ParsedCommand:
+        """Create parsed command from detected pattern"""
+        command_configs = {
+            'security_status': {
+                'type': CommandType.SECURITY_COMMAND,
+                'intent': 'security_status',
+                'confidence': 0.8,
+                'security_level': SecurityLevel.STANDARD
+            },
+            'autonomy_control': {
+                'type': CommandType.AUTONOMY_COMMAND,
+                'intent': 'autonomy_control',
+                'confidence': 0.7,
+                'security_level': SecurityLevel.ELEVATED
+            },
+            'memory_operations': {
+                'type': CommandType.MEMORY_COMMAND,
+                'intent': 'memory_operation',
+                'confidence': 0.75,
+                'security_level': SecurityLevel.STANDARD
+            },
+            'proactive_requests': {
+                'type': CommandType.PROACTIVE_COMMAND,
+                'intent': 'proactive_request',
+                'confidence': 0.8,
+                'security_level': SecurityLevel.STANDARD
+            },
+            'assistant_commands': {
+                'type': CommandType.ASSISTANT_COMMAND,
+                'intent': 'assistant_request',
+                'confidence': 0.7,
+                'security_level': SecurityLevel.STANDARD
+            }
+        }
+        
+        config = command_configs.get(command_type, {
+            'type': CommandType.NATURAL_LANGUAGE,
+            'intent': 'conversation',
+            'confidence': 0.6,
+            'security_level': SecurityLevel.STANDARD
+        })
+        
+        return ParsedCommand(
+            command_type=config['type'],
+            intent=config['intent'],
+            parameters={
+                'message': message,
+                'user_context': user_context,
+                'detected_pattern': pattern
+            },
+            confidence=config['confidence'],
+            requires_security=config['security_level'] != SecurityLevel.PUBLIC,
+            security_level=config['security_level']
+        )
+    
+    async def _create_natural_language_command(self, 
+                                             message: str, 
+                                             user_context: Dict[str, Any],
+                                             session: InteractionSession) -> ParsedCommand:
+        """Create natural language command with context analysis"""
+        # Analyze message for potential intents
+        intent_analysis = await self._analyze_message_intent(message, session)
+        
+        return ParsedCommand(
+            command_type=CommandType.NATURAL_LANGUAGE,
+            intent=intent_analysis.get('primary_intent', 'conversation'),
+            parameters={
+                'message': message,
+                'user_context': user_context,
+                'session_context': session.security_context,
+                'intent_analysis': intent_analysis
+            },
+            confidence=intent_analysis.get('confidence', 0.6),
+            requires_security=True,
+            security_level=SecurityLevel.STANDARD,
+            user_intent=intent_analysis.get('user_intent'),
+            context_tags=intent_analysis.get('tags', [])
+        )
+    
+    async def _analyze_message_intent(self, message: str, session: InteractionSession) -> Dict[str, Any]:
+        """Analyze message for deeper intent understanding"""
+        analysis = {
+            'primary_intent': 'conversation',
+            'confidence': 0.6,
+            'tags': [],
+            'user_intent': None
+        }
+        
+        # Basic intent detection
+        message_lower = message.lower()
+        
+        if any(word in message_lower for word in ['how', 'what', 'when', 'where', 'why', 'can you']):
+            analysis['primary_intent'] = 'information_request'
+            analysis['confidence'] = 0.7
+            analysis['tags'].append('question')
+        
+        if any(word in message_lower for word in ['thank', 'thanks', 'appreciate']):
+            analysis['primary_intent'] = 'gratitude'
+            analysis['confidence'] = 0.8
+            analysis['tags'].append('social')
+        
+        if any(word in message_lower for word in ['help', 'assist', 'support']):
+            analysis['primary_intent'] = 'help_request'
+            analysis['confidence'] = 0.75
+            analysis['tags'].append('assistance')
+        
+        # Contextual analysis based on session history
+        if session.message_count > 0:
+            analysis['tags'].append('follow_up')
+        
+        return analysis
+    
+    async def _route_command(self, 
+                           command: ParsedCommand, 
+                           security_context: Dict[str, Any],
+                           session: InteractionSession) -> str:
+        """Route command to appropriate handler"""
+        try:
+            if command.command_type == CommandType.IDENTITY_COMMAND:
+                return await self._handle_identity_command(command, security_context, session)
+            elif command.command_type == CommandType.SECURITY_COMMAND:
+                return await self._handle_security_command(command, security_context, session)
+            elif command.command_type == CommandType.SYSTEM_COMMAND:
+                return await self._handle_system_command(command, security_context, session)
+            elif command.command_type == CommandType.AUTONOMY_COMMAND:
+                return await self._handle_autonomy_command(command, security_context, session)
+            elif command.command_type == CommandType.MEMORY_COMMAND:
+                return await self._handle_memory_command(command, security_context, session)
+            elif command.command_type == CommandType.PROACTIVE_COMMAND:
+                return await self._handle_proactive_command(command, security_context, session)
+            elif command.command_type == CommandType.ASSISTANT_COMMAND:
+                return await self._handle_assistant_command(command, security_context, session)
+            else:
+                return await self._process_natural_language(command, security_context, session)
+                
+        except Exception as e:
+            logger.error("Error routing command: %s", e)
+            return f"Error processing command: {str(e)}"
+    
+    async def _handle_identity_command(self, 
+                                     command: ParsedCommand, 
+                                     security_context: Dict[str, Any],
+                                     session: InteractionSession) -> str:
+        """Handle identity commands with proper security and hologram integration"""
+        try:
+            user_id = security_context.get('user_id', 'owner')
+            
+            if command.intent == "set_preferred_name":
+                return await self._handle_identity_set_name(command, user_id, session)
+            elif command.intent == "set_birthday":
+                return await self._handle_identity_set_birthday(command, user_id, session)
+            elif command.intent == "get_identity":
+                return await self._handle_identity_query(command, user_id, session)
+            else:
+                return "Unknown identity command. Try using natural language like 'call me [name]' or 'my birthday is [date]'."
+                
+        except Exception as e:
+            logger.error("Error handling identity command: %s", e)
+            return f"Error processing identity command: {str(e)}"
+    
+    async def _handle_identity_set_name(self, command: ParsedCommand, user_id: str, session: InteractionSession) -> str:
+        """Handle setting preferred name"""
+        name = command.parameters.get('name')
+        if not name:
+            return "I didn't catch the name. Please try again like 'Call me Alex'."
+        
+        # Create hologram for identity update
+        hologram_id = await self._create_identity_hologram(
+            user_id, "name_update", {"new_name": name, "session_id": session.session_id})
+        
+        try:
+            # Update identity through identity manager
+            success = await self.identity_manager.set_preferred_name(user_id, name)
+            
+            if success:
+                # Update session context
+                session.security_context['preferred_name'] = name
+                
+                # Update hologram state
+                await self._update_hologram_state(hologram_id, "completed", {"success": True})
+                
+                logger.info("Successfully updated preferred name for %s to %s", user_id, name)
+                return f"I'll now address you as {name}. Your preferred name has been updated securely."
+            else:
+                await self._update_hologram_state(hologram_id, "failed", {"error": "identity_update_failed"})
+                return "I couldn't update your name. The identity system returned an error."
+                
+        except Exception as e:
+            await self._update_hologram_state(hologram_id, "error", {"exception": str(e)})
+            logger.error("Failed to update preferred name: %s", e)
+            return f"System error updating name: {str(e)}"
+    
+    async def _handle_identity_set_birthday(self, command: ParsedCommand, user_id: str, session: InteractionSession) -> str:
+        """Handle setting birthday"""
+        birthday = command.parameters.get('birthday')
+        if not birthday:
+            return "I didn't catch the birthday date. Please try again like 'My birthday is 29 February'."
+        
+        # Create hologram for birthday update
+        hologram_id = await self._create_identity_hologram(
+            user_id, "birthday_update", {"birthday": birthday, "session_id": session.session_id})
+        
+        try:
+            # Store birthday in secure memory
+            memory_data = {
+                "type": "personal_info",
+                "category": "birthday",
+                "value": birthday,
+                "security_level": "high",
+                "user_id": user_id,
+                "timestamp": time.time()
+            }
+            
+            # Use cognition core to store this information
+            storage_result = await self.cognition_core.process_request(
+                request_type="memory_store",
+                user_identity=user_id,
+                data=memory_data
+            )
+            
+            if storage_result.get('success', False):
+                # Update session context
+                session.security_context['birthday'] = birthday
+                
+                await self._update_hologram_state(hologram_id, "completed", {"success": True})
+                
+                # Add contextual response for leap day
+                if 'february 29' in birthday.lower() or 'feb 29' in birthday.lower():
+                    return f"I've stored your birthday ({birthday}) securely. That's a leap day! I'll remember this special date."
                 else:
-                    await asyncio.sleep(poll_interval)
+                    return f"I've stored your birthday ({birthday}) securely. I'll remember this important date."
+            else:
+                await self._update_hologram_state(hologram_id, "failed", {"error": "storage_failed"})
+                return "I couldn't store your birthday. The memory system returned an error."
+                
+        except Exception as e:
+            await self._update_hologram_state(hologram_id, "error", {"exception": str(e)})
+            logger.error("Failed to store birthday: %s", e)
+            return f"System error storing birthday: {str(e)}"
+    
+    async def _handle_identity_query(self, command: ParsedCommand, user_id: str, session: InteractionSession) -> str:
+        """Handle identity queries"""
+        # Create query hologram
+        hologram_id = await self._create_identity_hologram(user_id, "identity_query", {"session_id": session.session_id})
+        
+        try:
+            # Get user identity information
+            user_identity = await self.identity_manager.get_identity(user_id)
+            preferred_name = user_identity.get('preferred_name', 'Owner')
+            
+            # Build comprehensive response
+            response_parts = [f"Identity Information for {preferred_name}"]
+            response_parts.append(f"Security Level: {session.security_context.get('access_level', 'standard')}")
+            response_parts.append(f"Current Device: {session.security_context.get('source_device', 'unknown')}")
+            
+            # Add birthday if available
+            if session.security_context.get('birthday'):
+                response_parts.append(f"Birthday: {session.security_context['birthday']}")
+            
+            # Add access information
+            data_categories = session.security_context.get('data_categories', [])
+            if data_categories:
+                response_parts.append(f"Data Access: {', '.join(data_categories)}")
+            
+            # Add session information
+            response_parts.append(f"Session Messages: {session.message_count}")
+            response_parts.append(f"Session Duration: {int(time.time() - session.start_time)}s")
+            
+            await self._update_hologram_state(hologram_id, "completed", {"query_type": "full_identity"})
+            
+            return "\n".join(response_parts)
+            
+        except Exception as e:
+            await self._update_hologram_state(hologram_id, "error", {"exception": str(e)})
+            logger.error("Failed to query identity: %s", e)
+            return f"Error retrieving identity information: {str(e)}"
+    
+    async def _handle_security_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle security-related commands"""
+        try:
+            if command.intent == "security_status":
+                return await self._handle_security_status(command, security_context, session)
+            else:
+                return "Unknown security command. Try 'security status' for current security information."
+                
+        except Exception as e:
+            logger.error("Error handling security command: %s", e)
+            return f"Error processing security command: {str(e)}"
+    
+    async def _handle_security_status(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle security status command"""
+        user_id = security_context.get('user_id', 'owner')
+        
+        # Get comprehensive security status
+        status_info = {
+            "user": user_id,
+            "access_level": security_context.get('access_level', 'standard'),
+            "device": security_context.get('source_device', 'unknown'),
+            "data_categories": security_context.get('data_categories', []),
+            "authentication_method": security_context.get('auth_method', 'totp'),
+            "security_flow": security_context.get('flow_path', 'unknown'),
+            "session_id": session.session_id,
+            "message_count": session.message_count
+        }
+        
+        response = ["Comprehensive Security Status"]
+        response.append("User Identity")
+        response.append(f"User ID: {status_info['user']}")
+        response.append(f"Access Level: {status_info['access_level']}")
+        response.append(f"Auth Method: {status_info['authentication_method']}")
+        
+        response.append("Device & Session")
+        response.append(f"Device: {status_info['device']}")
+        response.append(f"Session: {status_info['session_id']}")
+        response.append(f"Messages: {status_info['message_count']}")
+        
+        response.append("Data Access")
+        response.append(f"Categories: {', '.join(status_info['data_categories'])}")
+        response.append(f"Security Flow: {status_info['security_flow']}")
+        
+        response.append("System Statistics")
+        response.append(f"Total Messages: {self.interaction_stats['total_messages']}")
+        response.append(f"Success Rate: {self._calculate_success_rate():.1f}%")
+        response.append(f"Active Sessions: {len(self.active_sessions)}")
+        
+        return "\n".join(response)
+    
+    async def _handle_system_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle system commands"""
+        try:
+            if command.intent == "system_exit":
+                return "Session ending. Type anything to start a new session."
+            elif command.intent == "system_status":
+                return await self._get_system_status()
+            elif command.intent == "system_health":
+                return await self._get_system_health()
+            elif command.intent == "system_help":
+                return await self._get_system_help()
+            elif command.intent == "system_stats":
+                return await self._get_system_stats(session)
+            elif command.intent == "system_clear":
+                await self._clear_conversation_context(session)
+                return "Conversation context cleared."
+            else:
+                return "Unknown system command."
+                
+        except Exception as e:
+            logger.error("Error handling system command: %s", e)
+            return f"Error processing system command: {str(e)}"
+    
+    async def _handle_autonomy_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle autonomy commands"""
+        if not self.autonomy_core:
+            return "Autonomy core is not available."
+        
+        try:
+            # Implement autonomy command handling
+            return "Autonomy features are currently under development."
+            
+        except Exception as e:
+            logger.error("Error handling autonomy command: %s", e)
+            return f"Error processing autonomy command: {str(e)}"
+    
+    async def _handle_memory_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle memory commands"""
+        try:
+            # Implement memory command handling
+            return "Memory operations are currently under development."
+            
+        except Exception as e:
+            logger.error("Error handling memory command: %s", e)
+            return f"Error processing memory command: {str(e)}"
+    
+    async def _handle_proactive_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle proactive commands"""
+        if not self.proactive_communicator:
+            return "Proactive communicator is not available."
+        
+        try:
+            # Implement proactive command handling
+            return "Proactive features are currently under development."
+            
+        except Exception as e:
+            logger.error("Error handling proactive command: %s", e)
+            return f"Error processing proactive command: {str(e)}"
+    
+    async def _handle_assistant_command(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession) -> str:
+        """Handle assistant commands"""
+        if not self.assistant_core:
+            return "Assistant core is not available."
+        
+        try:
+            # Implement assistant command handling
+            return "Assistant features are currently under development."
+            
+        except Exception as e:
+            logger.error("Error handling assistant command: %s", e)
+            return f"Error processing assistant command: {str(e)}"
+    
+    async def _process_natural_language(self, 
+                                      command: ParsedCommand, 
+                                      security_context: Dict[str, Any],
+                                      session: InteractionSession) -> str:
+        """Process natural language through cognition core with enhanced context"""
+        try:
+            # Enhance context with security and session information
+            enhanced_context = {
+                "user_identity": security_context.get('user_id'),
+                "access_level": security_context.get('access_level'),
+                "source_device": security_context.get('source_device'),
+                "data_categories": security_context.get('data_categories'),
+                "security_flow": security_context.get('flow_path'),
+                "session_id": session.session_id,
+                "message_count": session.message_count,
+                "preferred_name": session.security_context.get('preferred_name'),
+                "user_intent": command.user_intent,
+                "context_tags": command.context_tags
+            }
+            
+            # Add conversation context for continuity
+            if session.session_id in self.conversation_context:
+                enhanced_context["conversation_history"] = self.conversation_context[session.session_id]
+            
+            # Process through cognition core
+            response = await self.cognition_core.process_request(
+                request_type="user_message",
+                user_identity=security_context.get('user_id'),
+                message=command.parameters['message'],
+                context=enhanced_context
+            )
+            
+            # Update conversation context
+            await self._update_conversation_context(session, command.parameters['message'], response.get('response', ''))
+            
+            return response.get('response', 'I encountered an error processing your message.')
+            
+        except Exception as e:
+            logger.error("Error in natural language processing: %s", e)
+            return f"Error processing your message: {str(e)}"
+    
+    # Hologram Integration Methods
+    async def _initialize_hologram_states(self):
+        """Initialize hologram states for interaction tracking"""
+        try:
+            # Create main interaction hologram
+            main_hologram = HologramState(
+                node_id='interaction_core_main',
+                link_id='link_interaction_core',
+                state_type='core_system',
+                data={
+                    'initialized_at': time.time(),
+                    'version': '2.1.0',
+                    'subsystems': ['security', 'cognition', 'identity', 'session']
+                },
+                created_at=time.time(),
+                updated_at=time.time()
+            )
+            
+            self.active_holograms['interaction_core_main'] = main_hologram
+            
+            # Initialize hologram states registry
+            self.hologram_states = {
+                'interaction_core': {
+                    'node_id': 'interaction_core_main',
+                    'state': 'active',
+                    'created_at': time.time(),
+                    'interaction_count': 0,
+                    'last_command_type': None,
+                    'subsystem_states': {
+                        'session_manager': 'active',
+                        'command_parser': 'active',
+                        'security_integration': 'active'
+                    }
+                }
+            }
+            
+            logger.info("Hologram base state initialized for interaction core")
+            
+        except Exception as e:
+            logger.error("Error initializing hologram states: %s", e)
+    
+    async def _create_session_hologram(self, session: InteractionSession):
+        """Create hologram for a new session"""
+        try:
+            session_hologram = HologramState(
+                node_id=session.hologram_node_id,
+                link_id=f"link_{session.session_id}",
+                state_type='user_session',
+                data={
+                    'user_id': session.user_id,
+                    'device_id': session.device_id,
+                    'start_time': session.start_time,
+                    'security_level': session.security_context.get('access_level', 'unknown')
+                },
+                created_at=time.time(),
+                updated_at=time.time(),
+                ttl=7200  # 2 hours for sessions
+            )
+            
+            self.active_holograms[session.session_id] = session_hologram
+            logger.debug("Created session hologram for %s", session.session_id)
+            
+        except Exception as e:
+            logger.error("Error creating session hologram: %s", e)
+    
+    async def _create_identity_hologram(self, user_id: str, operation: str, data: Dict[str, Any]) -> str:
+        """Create a hologram state for identity operations"""
+        try:
+            hologram_id = f"identity_{operation}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            
+            identity_hologram = HologramState(
+                node_id=f"identity_{operation}",
+                link_id=f"link_{hologram_id}",
+                state_type='identity_operation',
+                data={
+                    'user_id': user_id,
+                    'operation': operation,
+                    **data
+                },
+                created_at=time.time(),
+                updated_at=time.time()
+            )
+            
+            self.active_holograms[hologram_id] = identity_hologram
+            logger.info("Created identity hologram: %s for %s", hologram_id, operation)
+            
+            return hologram_id
+            
+        except Exception as e:
+            logger.error("Error creating identity hologram: %s", e)
+            return f"error_{int(time.time())}"
+    
+    async def _update_hologram_state(self, hologram_id: str, new_state: str, additional_data: Dict[str, Any] = None):
+        """Update hologram state"""
+        try:
+            if hologram_id in self.active_holograms:
+                hologram = self.active_holograms[hologram_id]
+                hologram.state_type = new_state
+                hologram.updated_at = time.time()
+                
+                if additional_data:
+                    hologram.data.update(additional_data)
+                
+                logger.debug("Updated hologram %s to state %s", hologram_id, new_state)
+                
+        except Exception as e:
+            logger.error("Error updating hologram state: %s", e)
+    
+    async def _update_interaction_hologram(self, command: ParsedCommand, security_context: Dict[str, Any], session: InteractionSession):
+        """Update interaction hologram with command information"""
+        try:
+            if 'interaction_core' in self.hologram_states:
+                core_state = self.hologram_states['interaction_core']
+                core_state['interaction_count'] += 1
+                core_state['last_command_type'] = command.command_type.value
+                core_state['last_security_level'] = security_context.get('access_level')
+                core_state['last_session'] = session.session_id
+                core_state['updated_at'] = time.time()
+                
+                # Update session hologram
+                if session.session_id in self.active_holograms:
+                    session_hologram = self.active_holograms[session.session_id]
+                    session_hologram.data['message_count'] = session.message_count
+                    session_hologram.data['last_activity'] = session.last_activity
+                    session_hologram.updated_at = time.time()
+                
+        except Exception as e:
+            logger.error("Error updating interaction hologram: %s", e)
+    
+    async def _cleanup_holograms(self):
+        """Clean up expired hologram states"""
+        try:
+            current_time = time.time()
+            expired_holograms = []
+            
+            for hologram_id, hologram_data in self.active_holograms.items():
+                if current_time - hologram_data.created_at > hologram_data.ttl:
+                    expired_holograms.append(hologram_id)
+            
+            for hologram_id in expired_holograms:
+                del self.active_holograms[hologram_id]
+                
+            if expired_holograms:
+                logger.info("Cleaned up %d expired holograms", len(expired_holograms))
+                
+        except Exception as e:
+            logger.error("Error cleaning up holograms: %s", e)
+    
+    # Session Management Methods
+    async def _initialize_session_cleanup(self):
+        """Initialize session cleanup system"""
+        try:
+            # Clean up any stale sessions on startup
+            await self._cleanup_sessions()
+            logger.info("Session cleanup system initialized")
+            
+        except Exception as e:
+            logger.error("Error initializing session cleanup: %s", e)
+    
+    async def _cleanup_sessions(self):
+        """Clean up expired sessions"""
+        try:
+            current_time = time.time()
+            expired_sessions = []
+            
+            for session_id, session in self.active_sessions.items():
+                if current_time - session.last_activity > self.session_timeout:
+                    expired_sessions.append(session_id)
+            
+            for session_id in expired_sessions:
+                # Clean up session hologram
+                if session_id in self.active_holograms:
+                    del self.active_holograms[session_id]
+                
+                # Clean up conversation context
+                if session_id in self.conversation_context:
+                    del self.conversation_context[session_id]
+                
+                del self.active_sessions[session_id]
+                
+            if expired_sessions:
+                logger.info("Cleaned up %d expired sessions", len(expired_sessions))
+                
+        except Exception as e:
+            logger.error("Error cleaning up sessions: %s", e)
+    
+    # Context Management Methods
+    async def _initialize_context_manager(self):
+        """Initialize conversation context management"""
+        try:
+            self.conversation_context = {}
+            logger.info("Conversation context manager initialized")
+            
+        except Exception as e:
+            logger.error("Error initializing context manager: %s", e)
+    
+    async def _update_conversation_context(self, session: InteractionSession, user_message: str, assistant_response: str):
+        """Update conversation context for continuity"""
+        try:
+            if session.session_id not in self.conversation_context:
+                self.conversation_context[session.session_id] = []
+            
+            # Keep only last 10 exchanges to manage memory
+            context = self.conversation_context[session.session_id]
+            context.append({"user": user_message, "assistant": assistant_response})
+            
+            if len(context) > 10:
+                context.pop(0)
+                
+        except Exception as e:
+            logger.error("Error updating conversation context: %s", e)
+    
+    async def _clear_conversation_context(self, session: InteractionSession):
+        """Clear conversation context for a session"""
+        try:
+            if session.session_id in self.conversation_context:
+                del self.conversation_context[session.session_id]
+                
+        except Exception as e:
+            logger.error("Error clearing conversation context: %s", e)
+    
+    # Rate Limiting Methods
+    async def _check_rate_limit(self, user_context: Dict[str, Any]) -> bool:
+        """Check if user is within rate limits"""
+        try:
+            user_id = user_context.get('user_id', 'default')
+            current_time = time.time()
+            
+            if user_id not in self.rate_limits:
+                self.rate_limits[user_id] = []
+            
+            # Clean old requests (older than 1 minute)
+            user_requests = self.rate_limits[user_id]
+            user_requests = [req_time for req_time in user_requests if current_time - req_time < 60]
+            self.rate_limits[user_id] = user_requests
+            
+            # Check if within limit
+            if len(user_requests) >= self.max_requests_per_minute:
+                return False
+            
+            # Add current request
+            user_requests.append(current_time)
+            return True
+            
+        except Exception as e:
+            logger.error("Error checking rate limit: %s", e)
+            return True  # Fail open on error
+    
+    # Statistics and Monitoring Methods
+    async def _update_interaction_stats(self, start_time: float, success: bool):
+        """Update interaction statistics"""
+        try:
+            response_time = time.time() - start_time
+            
+            self.interaction_stats["total_messages"] += 1
+            
+            if success:
+                self.interaction_stats["successful_responses"] += 1
+            else:
+                self.interaction_stats["failed_responses"] += 1
+            
+            # Update average response time (moving average)
+            current_avg = self.interaction_stats["avg_response_time"]
+            total_successful = self.interaction_stats["successful_responses"]
+            
+            if total_successful > 0:
+                self.interaction_stats["avg_response_time"] = (
+                    (current_avg * (total_successful - 1) + response_time) / total_successful
+                )
+                
+        except Exception as e:
+            logger.error("Error updating interaction stats: %s", e)
+    
+    def _calculate_success_rate(self) -> float:
+        """Calculate current success rate"""
+        total = self.interaction_stats["total_messages"]
+        successful = self.interaction_stats["successful_responses"]
+        
+        if total == 0:
+            return 0.0
+        
+        return (successful / total) * 100
+    
+    async def _get_system_status(self) -> str:
+        """Get comprehensive system status"""
+        status_parts = ["System Status"]
+        
+        status_parts.append(f"Core State: {self.state.value}")
+        status_parts.append(f"Active Sessions: {len(self.active_sessions)}")
+        status_parts.append(f"Background Workers: {len(self.workers)}")
+        status_parts.append(f"Active Holograms: {len(self.active_holograms)}")
+        status_parts.append(f"Total Messages: {self.interaction_stats['total_messages']}")
+        status_parts.append(f"Success Rate: {self._calculate_success_rate():.1f}%")
+        
+        # Subsystem status
+        subsystems = {
+            "Security": self.security_orchestrator is not None,
+            "Cognition": self.cognition_core is not None,
+            "Autonomy": self.autonomy_core is not None,
+            "Proactive": self.proactive_communicator is not None,
+            "Assistant": self.assistant_core is not None
+        }
+        
+        status_parts.append("Subsystems:")
+        for name, available in subsystems.items():
+            status = "Available" if available else "Unavailable"
+            status_parts.append(f"{name}: {status}")
+        
+        return "\n".join(status_parts)
+    
+    async def _get_system_health(self) -> str:
+        """Get system health information"""
+        health_parts = ["System Health"]
+        
+        # Memory health (simplified)
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        health_parts.append(f"Memory Usage: {memory_mb:.1f} MB")
+        health_parts.append(f"Active Sessions: {len(self.active_sessions)}")
+        health_parts.append(f"Session Health: {'Good' if len(self.active_sessions) < 100 else 'Warning'}")
+        
+        # Rate limiting health
+        total_rate_limited = sum(1 for requests in self.rate_limits.values() if len(requests) > self.max_requests_per_minute * 0.8)
+        health_parts.append(f"Rate Limit Health: {'Good' if total_rate_limited == 0 else 'Monitoring'}")
+        
+        # Hologram health
+        hologram_health = "Good" if len(self.active_holograms) < 1000 else "High Load"
+        health_parts.append(f"Hologram Health: {hologram_health}")
+        
+        return "\n".join(health_parts)
+    
+    async def _get_system_help(self) -> str:
+        """Get system help information"""
+        help_parts = ["Available Commands"]
+        
+        help_parts.append("Identity Commands:")
+        help_parts.append("  'Call me [name]' - Set your preferred name")
+        help_parts.append("  'My birthday is [date]' - Store your birthday")
+        help_parts.append("  'Who am I?' - View your identity information")
+        
+        help_parts.append("Security Commands:")
+        help_parts.append("  'Security status' - View current security configuration")
+        help_parts.append("  'System status' - View system status")
+        
+        help_parts.append("System Commands:")
+        help_parts.append("  'status' - System status")
+        help_parts.append("  'health' - System health")
+        help_parts.append("  'stats' - Session statistics")
+        help_parts.append("  'help' - This help message")
+        help_parts.append("  'exit' - End session")
+        
+        help_parts.append("Natural Language:")
+        help_parts.append("  All other messages are processed as natural language")
+        
+        return "\n".join(help_parts)
+    
+    async def _get_system_stats(self, session: InteractionSession) -> str:
+        """Get system statistics"""
+        stats_parts = ["Session Statistics"]
+        
+        session_duration = time.time() - session.start_time
+        stats_parts.append(f"Duration: {session_duration:.1f}s")
+        stats_parts.append(f"Messages: {session.message_count}")
+        stats_parts.append(f"Success Rate: {self._calculate_success_rate():.1f}%")
+        stats_parts.append(f"Avg Response Time: {self.interaction_stats['avg_response_time']:.2f}s")
+        
+        stats_parts.append("Overall Statistics:")
+        stats_parts.append(f"Total Messages: {self.interaction_stats['total_messages']}")
+        stats_parts.append(f"Successful: {self.interaction_stats['successful_responses']}")
+        stats_parts.append(f"Failed: {self.interaction_stats['failed_responses']}")
+        stats_parts.append(f"Sessions: {self.interaction_stats['session_count']}")
+        
+        return "\n".join(stats_parts)
+    
+    # Background Workers
+    async def _background_worker(self):
+        """Main background worker for core maintenance"""
+        while self.is_running:
+            try:
+                # Perform regular maintenance tasks
+                await self._perform_maintenance()
+                await asyncio.sleep(60)  # Run every minute
+                
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception("Proactive worker encountered exception: %s", e)
-                await asyncio.sleep(1.0)
-        logger.debug("Proactive worker exiting")
-
-    # ---------------- Calendar & Contacts persistence (remains the same) ----------------
-    # This logic is now DEPRECATED because the agent will call
-    # autonomy.enqueue_action("calendar.add", ...), but we can leave it
-    # as a fallback for the (now-deleted) _interpret_and_execute_actions
-    async def _persist_calendar_event(self, event_obj: Dict[str, Any]):
-        core = self._get_core()
-        if not core: return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store or not hasattr(store, "get") or not hasattr(store, "put"): return
-        key = "calendar_events"
-        try:
-            get = getattr(store, "get")
-            existing = await get(key) if asyncio.iscoroutinefunction(get) else get(key)
-            if not existing: existing = []
-            existing.append(event_obj)
-            put = getattr(store, "put")
+                logger.error("Background worker error: %s", e)
+                await asyncio.sleep(30)
+    
+    async def _session_cleanup_worker(self):
+        """Worker for cleaning up expired sessions"""
+        while self.is_running:
             try:
-                maybe = put(key, "calendar", existing)
-            except TypeError:
-                maybe = put(key, existing)
-            if asyncio.iscoroutine(maybe): await maybe
-            await self._audit("calendar_event_persisted", {"event": event_obj}, {"status": "ok"})
-        except Exception as e:
-            logger.exception("Failed to persist calendar event: %s", e)
-
-    async def _persist_contact(self, contact_obj: Dict[str, Any]):
-        core = self._get_core()
-        if not core: return
-        store = getattr(core, "store", None) or getattr(core, "secure_store", None)
-        if not store or not hasattr(store, "get") or not hasattr(store, "put"): return
-        key = "contacts"
-        try:
-            get = getattr(store, "get")
-            existing = await get(key) if asyncio.iscoroutinefunction(get) else get(key)
-            if not existing: existing = []
-            existing.append(contact_obj)
-            put = getattr(store, "put")
-            try:
-                maybe = put(key, "contacts", existing)
-            except TypeError:
-                maybe = put(key, existing)
-            if asyncio.iscoroutine(maybe): await maybe
-            await self._audit("contact_persisted", {"contact": contact_obj}, {"status": "ok"})
-        except Exception as e:
-            logger.exception("Failed to persist contact: %s", e)
-
-    # ---------------- Outbound delivery (remains the same) ----------------
-    async def send_outbound(self, message: OutboundMessage):
-        async with self._queue_lock:
-            self.outbound_queue.append(message)
-            if PROMETHEUS_AVAILABLE:
-                try:
-                    metrics["queue_size"].set(len(self.outbound_queue))
-                except Exception:
-                    pass
-        logger.debug("Queued outbound message for user %s on channel %s", message.user_id, message.channel)
-
-    async def _outbound_worker(self):
-        while not self._stop_event.is_set():
-            try:
-                if not self.outbound_queue:
-                    await asyncio.sleep(0.05)
-                    continue
-                async with self._queue_lock:
-                    msg = self.outbound_queue.popleft()
-                    if PROMETHEUS_AVAILABLE:
-                        try:
-                            metrics["queue_size"].set(len(self.outbound_queue))
-                        except Exception:
-                            pass
-                delivered = await self._deliver_message_async(msg)
-                logger.debug("Delivered message to %s (delivered=%s)", msg.channel, delivered)
+                await self._cleanup_sessions()
+                await asyncio.sleep(300)  # Run every 5 minutes
+                
             except asyncio.CancelledError:
-                logger.info("Outbound worker cancelled; exiting")
                 break
-            except Exception:
-                logger.exception("Outbound worker error", exc_info=True)
-                await asyncio.sleep(0.5)
-
-    async def _deliver_message_async(self, message: OutboundMessage) -> bool:
-        # 1) deliver_hook
-        if callable(self.deliver_hook):
+            except Exception as e:
+                logger.error("Session cleanup worker error: %s", e)
+                await asyncio.sleep(60)
+    
+    async def _hologram_maintenance_worker(self):
+        """Worker for hologram maintenance"""
+        while self.is_running:
             try:
-                maybe = self.deliver_hook(message)
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-                return True
-            except Exception:
-                logger.debug("deliver_hook failed", exc_info=True)
-        # 2) core.notify
-        core = self._get_core()
-        if core and hasattr(core, "notify"):
+                await self._cleanup_holograms()
+                await asyncio.sleep(600)  # Run every 10 minutes
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Hologram maintenance worker error: %s", e)
+                await asyncio.sleep(60)
+    
+    async def _stats_monitoring_worker(self):
+        """Worker for monitoring and statistics"""
+        while self.is_running:
             try:
-                notify = getattr(core, "notify")
-                if asyncio.iscoroutinefunction(notify):
-                    await notify(channel=message.channel, message=message.content)
-                else:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, notify, message.channel, message.content)
-                return True
-            except Exception:
-                logger.debug("core.notify failed", exc_info=True)
-        # 3) persona.notify
-        if self.persona and hasattr(self.persona, "notify"):
-            try:
-                maybe = self.persona.notify(message)
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-                return True
-            except Exception:
-                logger.debug("persona.notify failed", exc_info=True)
-        # 4) fallback
+                # Log statistics periodically
+                if self.interaction_stats["total_messages"] > 0:
+                    success_rate = self._calculate_success_rate()
+                    logger.info(
+                        "Interaction stats - Total: %d, Success: %.1f%%, Avg Time: %.2fs",
+                        self.interaction_stats["total_messages"],
+                        success_rate,
+                        self.interaction_stats["avg_response_time"]
+                    )
+                
+                await asyncio.sleep(300)  # Run every 5 minutes
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Stats monitoring worker error: %s", e)
+                await asyncio.sleep(60)
+    
+    async def _perform_maintenance(self):
+        """Perform regular maintenance tasks"""
         try:
-            await self._audit("outbound_deliver", {"channel": message.channel, "content_preview": message.content[:120]}, {"status": "logged"})
-            return True
-        except Exception:
-            logger.warning("Failed to log outbound deliver as fallback", exc_info=True)
+            # Clean up rate limit data
+            current_time = time.time()
+            for user_id in list(self.rate_limits.keys()):
+                self.rate_limits[user_id] = [
+                    req_time for req_time in self.rate_limits[user_id] 
+                    if current_time - req_time < 120  # Keep only last 2 minutes
+                ]
+                if not self.rate_limits[user_id]:
+                    del self.rate_limits[user_id]
+            
+            # Update hologram states
+            if 'interaction_core' in self.hologram_states:
+                self.hologram_states['interaction_core']['maintenance_cycles'] = \
+                    self.hologram_states['interaction_core'].get('maintenance_cycles', 0) + 1
+                self.hologram_states['interaction_core']['last_maintenance'] = current_time
+            
+        except Exception as e:
+            logger.error("Error during maintenance: %s", e)
+    
+    # Public API Methods
+    def get_status(self) -> Dict[str, Any]:
+        """Get interaction core status"""
+        return {
+            "state": self.state.value,
+            "workers_active": len(self.workers),
+            "active_sessions": len(self.active_sessions),
+            "active_holograms": len(self.active_holograms),
+            "is_running": self.is_running,
+            "statistics": self.interaction_stats.copy()
+        }
+    
+    async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get information about a specific session"""
+        if session_id not in self.active_sessions:
+            return None
+        
+        session = self.active_sessions[session_id]
+        return {
+            "session_id": session.session_id,
+            "user_id": session.user_id,
+            "start_time": session.start_time,
+            "device_id": session.device_id,
+            "message_count": session.message_count,
+            "last_activity": session.last_activity,
+            "security_context": session.security_context
+        }
+    
+    async def list_active_sessions(self) -> List[Dict[str, Any]]:
+        """List all active sessions"""
+        sessions = []
+        for session in self.active_sessions.values():
+            sessions.append({
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "message_count": session.message_count,
+                "duration": time.time() - session.start_time
+            })
+        return sessions
+    
+    async def terminate_session(self, session_id: str) -> bool:
+        """Terminate a specific session"""
+        if session_id not in self.active_sessions:
             return False
+        
+        # Clean up session resources
+        if session_id in self.active_holograms:
+            del self.active_holograms[session_id]
+        
+        if session_id in self.conversation_context:
+            del self.conversation_context[session_id]
+        
+        del self.active_sessions[session_id]
+        logger.info("Terminated session: %s", session_id)
+        return True
 
-    # ---------------- Autosave (remains the same) ----------------
-    async def _autosave_worker(self, interval_sec: float):
-        while not self._stop_event.is_set():
-            try:
-                await asyncio.sleep(interval_sec)
-                await self._persist_sessions()
-                await self._persist_proactive_queue()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.debug("Autosave worker error", exc_info=True)
 
-    # ---------------- Serialization helper (remains the same) ----------------
-    def _serialize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        def _safe(v):
-            if v is None or isinstance(v, (str, int, float, bool)):
-                return v
-            if isinstance(v, (bytes, bytearray)):
-                return {"__bytes_base64": base64.b64encode(bytes(v)).decode("ascii")}
-            if isinstance(v, datetime):
-                return v.astimezone(timezone.utc).isoformat()
-            if hasattr(v, "value") and isinstance(getattr(v, "value"), (str, int, float, bool)):
-                return getattr(v, "value")
-            if hasattr(v, "name") and hasattr(v, "preferred_name"):
-                try:
-                    return {
-                        "identity_id": getattr(v, "identity_id", getattr(v, "user_id", None)),
-                        "name": getattr(v, "name", None),
-                        "preferred_name": getattr(v, "preferred_name", None),
-                        "relationship": getattr(v, "relationship", None)
-                    }
-                except Exception:
-                    return str(v)
-            if isinstance(v, dict):
-                return {str(k): _safe(val) for k, val in v.items()}
-            if isinstance(v, (list, tuple, set, deque)):
-                return [_safe(x) for x in v]
-            try:
-                return json.loads(json.dumps(v, default=str))
-            except Exception:
-                return str(v)
-        out = {}
-        for k, v in (metadata.items() if isinstance(metadata, dict) else []):
-            try:
-                out[str(k)] = _safe(v)
-            except Exception:
-                out[str(k)] = str(v)
-        return out
-
-    # ---------------- Name handling & security helpers (DELETED) ----------------
-    # async def _handle_set_name_directly(self, ...) -> OutboundMessage: ...
-    # async def _process_access_command(self, ...) -> OutboundMessage: ...
-    # async def _process_identity_command(self, ...) -> OutboundMessage: ...
-    # def _parse_security_params(self, ...) -> Dict[str, Any]: ...
-
-    # ---------------- Fallback helpers (remains the same) ----------------
-    async def _get_rate_limit_fallback(self, query: str) -> str:
-        if hasattr(self.cognition, "_get_rate_limit_fallback"):
-            fallback = self.cognition._get_rate_limit_fallback(query)
-            if asyncio.iscoroutine(fallback):
-                return await fallback
-            return fallback
-        return "[Rate limited - please try again in a moment]"
-
-    async def _get_fallback_reasoning(self, query: str) -> str:
-        if hasattr(self.cognition, "_get_fallback_reasoning"):
-            fb = self.cognition._get_fallback_reasoning(query)
-            if asyncio.iscoroutine(fb):
-                return await fb
-            return fb
-        return "[Service temporarily unavailable - please try again later]"
-
-    # ---------------- (DELETED) ----------------
-    # async def _apply_immediate_personalization(self, ...): ...
-
-    # ---------------- Factory wrapper (remains the same) ----------------
-    async def shutdown(self, wait_seconds: float = 5.0):
-        await self.stop(wait_seconds)
-
-# ---------------- Factory (remains the same) ----------------
-async def create_interaction_core(persona: Any = None, cognition: Any = None, autonomy: Any = None, config: Optional[Dict[str, Any]] = None) -> InteractionCore:
-    # wire security orchestrator if available on persona.core and not provided explicitly
-    cfg = dict(config or {})
-    try:
-        if "security_orchestrator" not in cfg and persona and hasattr(persona, "core") and hasattr(persona.core, "security_orchestrator"):
-            cfg["security_orchestrator"] = persona.core.security_orchestrator
-    except Exception:
-        pass
-    interaction_core = InteractionCore(persona=persona, cognition=cognition, autonomy=autonomy, config=cfg)
-    logger.info("InteractionCore constructed successfully; call await start() to begin workers")
-    return interaction_core
+# Factory function for creating InteractionCore instance
+async def create_interaction_core(
+    security_orchestrator: SecurityOrchestrator, 
+    cognition_core: CognitionCore,
+    autonomy_core: Optional[AutonomyCore] = None,
+    proactive_communicator: Optional[ProactiveCommunicator] = None,
+    assistant_core: Optional[AssistantCore] = None
+) -> EnhancedInteractionCore:
+    """Create and initialize an EnhancedInteractionCore instance"""
+    core = EnhancedInteractionCore(
+        security_orchestrator=security_orchestrator,
+        cognition_core=cognition_core,
+        autonomy_core=autonomy_core,
+        proactive_communicator=proactive_communicator,
+        assistant_core=assistant_core
+    )
+    await core.start()
+    logger.info("InteractionCore constructed successfully")
+    return core
