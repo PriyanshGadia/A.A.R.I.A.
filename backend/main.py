@@ -56,8 +56,12 @@ try: from autonomy_core import AutonomyCore, create_autonomy_core
 except Exception: AutonomyCore, create_autonomy_core = None, None
 try: from interaction_core import InteractionCore, InboundMessage, create_interaction_core
 except Exception: InteractionCore, InboundMessage, create_interaction_core = None, None, None
-try: from memory_manager import MemoryManager
-except Exception: MemoryManager = None
+try:
+    from memory_manager import MemoryManager
+except Exception:
+    MemoryManager = None
+    import logging
+    logging.getLogger("AARIA.System").error("Memory Manager not available - cannot load memory subsystem")
 try: from access_control import AccessControlSystem, AccessLevel, RequestSource
 except Exception: AccessControlSystem = None
 try: from identity_manager import IdentityManager
@@ -223,9 +227,16 @@ class AARIASystem:
 
             # 4. Memory Manager (Root Database)
             self.logger.info("Initializing Memory Manager...")
-            memory_manager = MemoryManager(assistant_core=assistant)
-            self.components["memory_manager"] = memory_manager
-            assistant.memory_manager = memory_manager # Inject back into core
+            if MemoryManager:
+                memory_manager = MemoryManager(assistant_core=assistant)
+                # If MemoryManager has async initialize, call it
+                if hasattr(memory_manager, "initialize") and inspect.iscoroutinefunction(memory_manager.initialize):
+                    await memory_manager.initialize()
+                self.components["memory_manager"] = memory_manager
+                assistant.memory_manager = memory_manager  # Inject back into core
+            else:
+                self.logger.error("Memory Manager not available - cannot continue")
+                return False
 
             # --- [NEW ORDER] ---
             # 5. Proactive Communicator (must be created before Persona)

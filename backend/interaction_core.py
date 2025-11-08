@@ -747,7 +747,7 @@ class InteractionCore:
                         # Execute the security command and get the string response
                         # This re-uses all your existing, robust security logic!
                         final_response_text = await self.security_orchestrator.process_security_command(
-                            command, {}, identity_profile # Pass the identified identity
+                            command, params, identity_profile # Pass the identified identity
                         )
                 
                 elif tool_name == "autonomy_action":
@@ -757,6 +757,20 @@ class InteractionCore:
                         final_response_text = f"❌ Autonomy system is offline or action type was missing."
                         plan_succeeded = False
                     else:
+                        # Persist a short memory record about the requested action so
+                        # important user-provided data (like contact names, birthdays)
+                        # are searchable immediately even if the autonomous action runs
+                        # separately.
+                        try:
+                            if hasattr(self, "persona") and hasattr(self.persona, "store_memory"):
+                                user_desc = f"Requested action: {action_type} - {details.get('title') or details.get('name') or details.get('q') or ''}"
+                                assistant_desc = json.dumps({"action_request_details": details}, default=str)
+                                maybe = self.persona.store_memory(user_desc, assistant_desc, importance=3, metadata={"source":"interaction","action_type":action_type}, subject_identity_id=getattr(self.persona, 'session_identity_id', 'owner_primary'))
+                                if asyncio.iscoroutine(maybe):
+                                    await maybe
+                        except Exception:
+                            logger.debug("Failed to pre-persist autonomy action details to persona memory (non-fatal)")
+
                         # Enqueue the action for AutonomyCore to handle
                         # This correctly fixes the "Yash's birthday" reminder flow
                         await self.autonomy.enqueue_action(

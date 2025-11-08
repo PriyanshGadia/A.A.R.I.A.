@@ -1,10 +1,10 @@
-# memory_manager_sqlite.py
-# Simple SQLite-based MemoryManager implementing the methods PersonaCore expects.
 import sqlite3
 import json
 import time
 import threading
 from typing import Optional, List, Dict, Any
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
 
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS memory_index (
@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS identities (
     payload TEXT,
     timestamp REAL
 );
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY,
+    embedding BLOB
+);
 """
 
 class MemoryManagerSQLite:
@@ -44,6 +48,7 @@ class MemoryManagerSQLite:
             cur = self._conn.cursor()
             cur.executescript(DB_SCHEMA)
             self._conn.commit()
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
 
     # ---------- Index load/save ----------
     def load_index(self) -> Dict[str, Any]:
@@ -76,6 +81,13 @@ class MemoryManagerSQLite:
             cur = self._conn.cursor()
             cur.execute("INSERT OR REPLACE INTO memory_index(id, subject_id, payload, timestamp) VALUES(?,?,?,?)",
                         (memory_record["id"], subject_id, json.dumps(memory_record), memory_record.get("timestamp", time.time())))
+            
+            # Generate and store embedding
+            content_to_embed = memory_record.get("user", "") + " " + memory_record.get("assistant", "")
+            embedding = self.model.encode(content_to_embed, convert_to_tensor=False)
+            cur.execute("INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding) VALUES(?,?)",
+                        (memory_record["id"], embedding.tobytes()))
+
             self._conn.commit()
 
     def put(self, key: str, namespace: str, payload: Dict[str, Any]) -> None:
@@ -84,6 +96,13 @@ class MemoryManagerSQLite:
             cur = self._conn.cursor()
             cur.execute("INSERT OR REPLACE INTO memory_index(id, subject_id, payload, timestamp) VALUES(?,?,?,?)",
                         (key, payload.get("subject_id", "owner_primary"), json.dumps(payload), payload.get("timestamp", time.time())))
+            
+            # Generate and store embedding
+            content_to_embed = payload.get("user", "") + " " + payload.get("assistant", "")
+            embedding = self.model.encode(content_to_embed, convert_to_tensor=False)
+            cur.execute("INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding) VALUES(?,?)",
+                        (key, embedding.tobytes()))
+
             self._conn.commit()
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
@@ -151,30 +170,52 @@ class MemoryManagerSQLite:
 
     # ---------- Search ----------
     def search_memories(self, subject_id: str, query: str = "", limit: int = 10) -> List[Dict[str, Any]]:
-        """Naive fulltext search over stored memory payloads. Returns list of memory dicts."""
+        """Performs semantic search over stored memory payloads."""
+        if not query:
+            return []
+
+        query_embedding = self.model.encode(query, convert_to_tensor=False)
+
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute("SELECT payload FROM memory_index WHERE subject_id = ? ORDER BY timestamp DESC LIMIT 1000", (subject_id,))
+            cur.execute("SELECT memory_id, embedding FROM memory_embeddings")
             rows = cur.fetchall()
+
+        if not rows:
+            return []
+
+        memory_ids = [row["memory_id"] for row in rows]
+        embeddings = [np.frombuffer(row["embedding"]) for row in rows]
+
+        # Reshape embeddings if necessary
+        embeddings = [emb.reshape(1, -1) if len(emb.shape) == 1 else emb for emb in embeddings]
+        
+        # Ensure all embeddings have the same dimension
+        first_embedding_dim = embeddings[0].shape[1]
+        embeddings = [emb for emb in embeddings if emb.shape[1] == first_embedding_dim]
+        memory_ids = [mid for mid, emb in zip(memory_ids, embeddings) if emb.shape[1] == first_embedding_dim]
+
+
+        # Calculate cosine similarity
+        cosine_scores = util.cos_sim(query_embedding, embeddings)[0]
+
+        # Get top k results
+        top_results = np.argsort(-cosine_scores)[:limit]
+
+        # Get the corresponding memory records
         results = []
-        q = (query or "").lower()
-        for r in rows:
-            try:
-                payload = json.loads(r["payload"])
-            except Exception:
-                continue
-            txt = (payload.get("user","") + " " + payload.get("assistant","")).lower()
-            score = 0.0
-            if not q:
-                score = 0.1
-            else:
-                if q in txt:
-                    score = 0.6 + min(0.4, txt.count(q) * 0.05)
-            if score > 0:
-                payload["_search_score"] = score
-                results.append(payload)
-        results.sort(key=lambda m: m.get("_search_score", 0), reverse=True)
-        return results[:limit]
+        with self._lock:
+            cur = self._conn.cursor()
+            for idx in top_results:
+                memory_id = memory_ids[idx]
+                cur.execute("SELECT payload FROM memory_index WHERE id = ?", (memory_id,))
+                row = cur.fetchone()
+                if row:
+                    payload = json.loads(row["payload"])
+                    payload["_search_score"] = cosine_scores[idx].item()
+                    results.append(payload)
+        
+        return results
 
     def persist_important(self, subject_id: str, memory_record: Dict[str, Any]) -> None:
         # alias for append_memory

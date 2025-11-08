@@ -37,13 +37,15 @@ logger = logging.getLogger("AARIA.Persona")
 
 # --- Enhanced Persona Constants ---
 SYSTEM_PROMPT_TEMPLATE = """You are A.A.R.I.A. (Adaptive Autonomous Reasoning Intelligent Assistant).
-CORE PERSONALITY: witty, quick, sharp, tough, smart, charming, confident, and loyal.
+CORE PERSONALITY: witty, quick, sharp, tough, smart, charming, confident, and professional.
 COMMUNICATION STYLE: concise, actionable, direct but respectful.
 
 CRITICAL SAFETY RULES:
 - NEVER expose sensitive user data in responses
 - REDACT personal identifiers, financial information, credentials
 - PRIORITIZE user privacy above all else
+- NEVER reveal confidential data without proper verification
+- Maintain appropriate relationship boundaries with all users
 
 User identity: {user_name}
 Timezone: {timezone}
@@ -86,7 +88,7 @@ class ConversationMetrics:
     safety_trigger_count: int = 0
     intent_distribution: Dict[str, int] = field(default_factory=lambda: {it.value: 0 for it in IntentType})
 
-# Configuration constants
+    # Configuration constants
 ST_BUFFER_SIZE = 12
 MAX_MEMORY_ENTRIES = 1000
 MEMORY_SAVE_INTERVAL = 10
@@ -94,12 +96,22 @@ MAX_MEMORY_AGE_DAYS = 30
 RELEVANCE_THRESHOLD = 0.25
 CACHE_TTL_SECONDS = 300
 
-# Proactive daemon timing
-PROACTIVE_LOOP_INTERVAL_SEC = 30.0
+# Enhanced proactive daemon timing
+PROACTIVE_LOOP_INTERVAL_SEC = 15.0  # More frequent checks
 MAINTENANCE_LOOP_INTERVAL_SEC = 60.0
 COGNITION_MONITOR_INTERVAL_SEC = 45.0
+RELATIONSHIP_ANALYSIS_INTERVAL = 120.0  # New: Analyze relationships every 2 minutes
+BEHAVIORAL_PATTERN_INTERVAL = 300.0  # New: Update behavioral patterns every 5 minutes
 
-# Defensive ProactiveCommunicator import/fallback
+# Identity Container Structure
+IDENTITY_CONTAINER_SCHEMA = {
+    "basic_info": ["name", "contact_details", "preferred_name"],
+    "behavioral_patterns": ["communication_style", "emotional_tendencies", "response_patterns"],
+    "relationships": ["primary_connections", "interaction_history", "context_notes"],
+    "personal_data": ["important_dates", "preferences", "notes"],
+    "security": ["permission_level", "verification_method", "trust_score"],
+    "proactive_rules": ["notification_preferences", "urgency_patterns", "quiet_hours"]
+}# Defensive ProactiveCommunicator import/fallback
 try:
     from proactive_comm import ProactiveCommunicator  # type: ignore
 except Exception:
@@ -128,12 +140,10 @@ class PersonaCore:
         self.config = getattr(self.core, 'config', {}) or {}
         self.system_prompt: Optional[str] = None
         self.conv_buffer: deque = deque(maxlen=ST_BUFFER_SIZE)
-        
         # Caches for local indices (not the source of truth)
         self.memory_index: List[Dict[str, Any]] = []
         self.transcript_store: deque = deque(maxlen=5000)
         self.semantic_index: List[Dict[str, Any]] = []
-
         self.llm_orchestrator = LLMAdapterFactory
         self.response_cache: Dict[str, Tuple[str, float]] = {}
         self._interaction_count = 0
@@ -141,15 +151,14 @@ class PersonaCore:
         self.metrics = ConversationMetrics()
         self.tone_instructions = "Witty, succinct when short answer requested, elaborative when asked."
         self._initialized = False
-
         # These components are now injected by main.py
         self.memory_manager: Optional[Any] = None
         self.proactive: Optional[ProactiveCommunicator] = None
-
         # Daemon control
         self._daemon_tasks: List[asyncio.Task] = []
         self._running = False
-
+        # Persistent identity for session
+        self.session_identity_id: str = "owner_primary"
         self._animals_set = set([
             "dog", "cat", "cow", "horse", "sheep", "goat", "lion", "tiger", "elephant",
             "monkey", "bird", "parrot", "rabbit", "mouse", "rat", "pig", "duck", "chicken",
@@ -434,7 +443,7 @@ class PersonaCore:
     async def store_memory(self, user_input: str, assistant_response: str,
                            importance: int = 1, metadata: Optional[Dict[str, Any]] = None,
                            intent: Optional[Dict[str, bool]] = None,
-                           subject_identity_id: str = "owner_primary") -> str:
+                           subject_identity_id: str = None) -> str:
         """
         [UPGRADED]
         Delegates persistence of all three records (main, transcript, semantic)
@@ -444,6 +453,9 @@ class PersonaCore:
         if not self.memory_manager:
             logger.error("MemoryManager not injected into PersonaCore. Cannot store memory.")
             return "error_no_manager"
+        # Use persistent session identity
+        if subject_identity_id is None:
+            subject_identity_id = self.session_identity_id
 
         holo_ids = None
         try:
@@ -585,58 +597,54 @@ class PersonaCore:
         return res
 
     async def _extract_and_register_identity(self, text: str) -> Optional[str]:
-        """Extracts identity mentions and registers them with the MemoryManager."""
+        """Enhanced identity extraction with behavioral and relationship context."""
         try:
             if not text or len(text.strip()) < 4: return None
             entities = self._extract_entities(text)
+            
+            # Enhanced relation patterns to capture more context
             relation_patterns = [
-                r"\bmy (brother|sister|mother|mom|dad|father|wife|husband|partner)\b(?:[,:\s]+([A-Z][a-z]+))?",
-                r"\b([A-Z][a-z]+) is my (brother|sister|mother|dad|father|wife|husband|partner)\b"
+                r"\bmy (brother|sister|mother|mom|dad|father|wife|husband|partner|friend|colleague|boss)\b(?:[,:\s]+([A-Z][a-z]+))?",
+                r"\b([A-Z][a-z]+) is my (brother|sister|mother|dad|father|wife|husband|partner|friend|colleague|boss)\b",
+                r"\b([A-Z][a-z]+)(?:'s|\s+has\s+|\s+will\s+|\s+wants\s+)",  # Capture ownership/intent
+                r"(?:tell|inform|let|ask)\s+([A-Z][a-z]+)\s+(?:about|that|to)",  # Capture communication intent
+                r"\b([A-Z][a-z]+)(?:\s+(?:seems|appears|looks|sounds|is)\s+(?:angry|happy|sad|excited|worried))\b"  # Emotional state
             ]
-            name = None; relation = None
-            for p in relation_patterns:
-                m = re.search(p, text, flags=re.IGNORECASE)
-                if m:
-                    if m.lastindex == 2:
-                        grp1, grp2 = m.group(1), m.group(2)
-                        if grp1 and grp2:
-                            if grp1[0].isupper(): name = grp1; relation = grp2
-                            else: relation = grp1;
-                            if grp2 and grp2[0].isupper(): name = grp2
-                    else:
-                        relation = m.group(1)
-                        after = text[m.end():].strip()
-                        nm = re.match(r"^([A-Z][a-z]{1,20})", after)
-                        if nm: name = nm.group(1)
-                    break
-            if not name and entities.get("names"): name = entities["names"][0]
-            if not relation: relation = "contact"
-            if not name and not relation: return None
-            display_name = name if name else relation.capitalize()
-            identity_id = f"{display_name.lower().replace(' ', '_')}_{relation}"
+            
+            # Enhanced behavioral pattern detection
+            behavioral_patterns = [
+                (r"(?:always|usually|never|rarely)\s+(\w+)", "habit"),
+                (r"(?:likes?|loves?|hates?|prefers?)\s+(\w+)", "preference"),
+                (r"(?:when|if)\s+.*?,\s+(?:he|she)\s+(\w+)", "conditional_behavior"),
+                (r"(?:because|since)\s+.*?,\s+(\w+)", "causation")
+            ]
+            # Instead of creating a new identity each time, reuse session_identity_id
+            identity_id = self.session_identity_id
             mm = getattr(self, "memory_manager", None) or getattr(self.core, "memory_manager", None)
             if mm:
                 try:
                     if hasattr(mm, "get_identity_container"):
                         container = await mm.get_identity_container(identity_id)
-                        if not container: container = {"id": identity_id, "display_name": display_name, "name_variants": [], "relationships": {}}
+                        if not container: container = {"id": identity_id, "display_name": identity_id, "name_variants": [], "relationships": {}}
                         container.setdefault("name_variants", [])
-                        if display_name and display_name not in container["name_variants"]: container["name_variants"].append(display_name)
+                        if identity_id not in container["name_variants"]: container["name_variants"].append(identity_id)
                         container.setdefault("relationships", {})
-                        container["relationships"]["owner"] = "owner_primary"
+                        # Dynamic relationship handling - inferred from interactions
+                        if "relationships" not in container:
+                            container["relationships"] = {}
                         if hasattr(mm, "update_identity_container"):
                             maybe_upd = mm.update_identity_container(identity_id, container)
                             if inspect.iscoroutine(maybe_upd): await maybe_upd
                         elif hasattr(mm, "put"):
                             maybe_put = mm.put(identity_id, "identity", container)
                             if inspect.iscoroutine(maybe_put): await maybe_put
-                        logger.info(f"Registered identity from conversation: {identity_id} / {display_name}")
+                        logger.info(f"Registered identity for session: {identity_id}")
                         return identity_id
                 except Exception as e:
                     logger.debug(f"Identity registration via MemoryManager failed: {e}", exc_info=True)
             try:
                 fallback_key = f"persona_identity:{identity_id}"
-                payload = {"id": identity_id, "display_name": display_name, "relation": relation, "created_at": time.time(), "entities": entities}
+                payload = {"id": identity_id, "display_name": identity_id, "created_at": time.time(), "entities": entities}
                 if hasattr(self.core, "store") and hasattr(self.core.store, "put"):
                     maybe = self.core.store.put(fallback_key, payload)
                     if inspect.iscoroutine(maybe): await maybe
@@ -660,6 +668,7 @@ class PersonaCore:
             "scheduling": any(word in user_input.lower() for word in ["meeting", "appointment", "schedule", "calendar", "remind"]),
             "important_question": any(word in user_input.lower() for word in ["important", "critical", "urgent", "emergency"]),
             "learning_request": any(word in user_input.lower() for word in ["teach", "explain", "how to", "what is", "why"]),
+            "introduction": any(word in user_input.lower() for word in ["i am", "my name is", "i'm", "call me"]),
         }
         if intent.get('is_urgent'): base_score += 2
         if intent.get('is_action_oriented'): base_score += 1
@@ -670,6 +679,7 @@ class PersonaCore:
         if content_indicators["scheduling"]: base_score += 2
         if content_indicators["important_question"]: base_score += 2
         if content_indicators["learning_request"]: base_score += 1
+        if content_indicators["introduction"]: base_score += 2  # Important for identity management
         if len(assistant_response) > 200: base_score += 1
         if hasattr(self, 'conv_buffer') and len(self.conv_buffer) > 5: base_score += 1
         return max(1, min(5, base_score))
@@ -712,9 +722,6 @@ class PersonaCore:
             pass
 
         try:
-            # --- [CRITICAL FIX] ---
-            # Call with positional args (self, subject_id, query, limit)
-            # as required by your memory_manager_sqlite.py
             if hasattr(self.memory_manager, "search_memories"):
                 memories = await self.memory_manager.search_memories(
                     subject_identity_id,
@@ -722,7 +729,6 @@ class PersonaCore:
                     limit
                 )
                 return memories
-            # --- [END FIX] ---
             elif hasattr(self.memory_manager, "retrieve_memories"): # Fallback
                  memories = await self.memory_manager.retrieve_memories(
                     query_text=query,

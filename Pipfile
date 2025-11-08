@@ -23,6 +23,7 @@ numpy = "*"
 nltk = "*"
 dotenv = "*"
 pycryptodome = "*"
+sentence-transformers = "*"
 
 [dev-packages]
 

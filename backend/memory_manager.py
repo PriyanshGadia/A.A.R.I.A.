@@ -1,4 +1,5 @@
 # memory_manager.py
+# Forcing recompile to fix stale bytecode issue.
 """
 MemoryManager with Hologram Integration for A.A.R.I.A.
 
@@ -86,6 +87,127 @@ class MemoryManager:
             "audit": asyncio.Lock(),
             "identity": asyncio.Lock()
         }
+
+        # Hierarchical segmentation
+        self._confidential_key = lambda: self._root_key("confidential")
+        self._access_key = lambda: self._root_key("access_data")
+        self._public_key = lambda: self._root_key("public_data")
+
+        # Identity-centric containers
+        self._identity_containers: Dict[str, Dict[str, Any]] = {}
+
+        # Encryption placeholder (replace with real crypto integration)
+        self._encrypt = lambda data: data  # TODO: integrate AES-256
+        self._decrypt = lambda data: data
+
+    async def create_or_get_identity_container(self, identity_id: str, name: str = None) -> Dict[str, Any]:
+        """
+        Create or retrieve a unique identity container for each entity.
+        Stores: name, contact, behavioral, relationship, permissions, memory_index
+        """
+        async with self._locks["identity"]:
+            container = self._identity_containers.get(identity_id)
+            if not container:
+                container = {
+                    "identity_id": identity_id,
+                    "name": name,
+                    "contact": {},
+                    "behavioral": [],
+                    "relationship": [],
+                    "permissions": {
+                        "level": "public",  # default
+                        "allowed": []
+                    },
+                    "memory_index": []
+                }
+                self._identity_containers[identity_id] = container
+            return container
+
+    async def update_behavioral(self, identity_id: str, behavior: str):
+        container = await self.create_or_get_identity_container(identity_id)
+        if behavior and behavior not in container["behavioral"]:
+            container["behavioral"].append(behavior)
+
+    async def update_relationship(self, identity_id: str, relation: str):
+        container = await self.create_or_get_identity_container(identity_id)
+        if relation and relation not in container["relationship"]:
+            container["relationship"].append(relation)
+
+    async def set_permission_level(self, identity_id: str, level: str, allowed: list = None):
+        container = await self.create_or_get_identity_container(identity_id)
+        container["permissions"]["level"] = level
+        if allowed is not None:
+            container["permissions"]["allowed"] = allowed
+
+    async def store_memory(self, identity_id: str, memory_record: Dict[str, Any], segment: str = "confidential") -> str:
+        """
+        Store memory in the correct segment and link to identity container.
+        """
+        key = None
+        if segment == "confidential":
+            key = self._confidential_key()
+        elif segment == "access":
+            key = self._access_key()
+        elif segment == "public":
+            key = self._public_key()
+        else:
+            key = self._confidential_key()
+        # Encrypt memory
+        encrypted = self._encrypt(memory_record)
+        async with self._locks["store"]:
+            if self.store is not None:
+                put = getattr(self.store, "put", None)
+                if put:
+                    await put(key, segment, encrypted)
+            else:
+                self._inmem.setdefault(key, []).append(encrypted)
+        # Link to identity container
+        container = await self.create_or_get_identity_container(identity_id)
+        container["memory_index"].append(key)
+        return key
+
+    async def retrieve_memories(self, identity_id: str, segment: str = None) -> list:
+        """
+        Retrieve all memories for an identity, optionally filtered by segment.
+        """
+        container = await self.create_or_get_identity_container(identity_id)
+        keys = container["memory_index"]
+        results = []
+        async with self._locks["store"]:
+            for key in keys:
+                if segment and segment not in key:
+                    continue
+                if self.store is not None:
+                    get = getattr(self.store, "get", None)
+                    if get:
+                        data = await get(key, segment)
+                        results.append(self._decrypt(data))
+                else:
+                    for item in self._inmem.get(key, []):
+                        results.append(self._decrypt(item))
+        return results
+
+    async def get_identity_profile(self, identity_id: str) -> Dict[str, Any]:
+        """
+        Return the full profile for an identity (name, behavioral, relationship, permissions).
+        """
+        return await self.create_or_get_identity_container(identity_id)
+
+    # Access control enforcement
+    def can_access(self, identity_id: str, segment: str) -> bool:
+        container = self._identity_containers.get(identity_id)
+        if not container:
+            return False
+        level = container["permissions"]["level"]
+        if segment == "confidential":
+            return level == "owner"
+        elif segment == "access":
+            return level in ("owner", "privileged")
+        elif segment == "public":
+            return True
+        return False
+
+    # TODO: Integrate real encryption, biometric authentication, and remove hardcoded defaults
 
     # -----------------------
     # Key helpers (remains the same)

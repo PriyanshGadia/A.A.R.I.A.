@@ -319,12 +319,15 @@ class AccessControlSystem:
     # FLOWCHART IMPLEMENTATION - Main Decision Flow
     async def process_request_flow(self, request_data: Dict[str, Any]) -> SecurityContext:
         """
-        Implement the complete flowchart logic:
-        1. Request Identification -> Owner vs Public
-        2. Owner: Source Identification -> Private vs Remote Terminal  
-        3. Public: Secondary Identification -> Privileged vs General
-        4. Route to appropriate data access
-        Enhanced flowchart implementation with device awareness
+        Enhanced hierarchical security flow implementation following the Root Database architecture:
+        1. Request Identification (Owner vs Public)
+        2. Source Validation & Device Trust Analysis
+        3. Access Level Determination based on flowchart
+        4. Data Category Segmentation (Root → Confidential → Access → Public)
+        5. Identity Container Access Control
+        
+        This implements the complete security flowchart while treating AARIA as a 
+        sovereign entity that acts as owner's extension, not a public service.
         """
         logger.info("🔄 Processing enhanced security flowchart...")
         

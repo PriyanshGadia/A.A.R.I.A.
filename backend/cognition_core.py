@@ -300,7 +300,7 @@ class CognitionCore:
             "tool_name": "autonomy_action",
             "description": (
                 "Enqueues a task for the autonomous system to execute. Use this for: "
-                "setting reminders, adding/listing calendar events, managing contacts, or sending notifications."
+                "setting reminders, adding/listing/searching calendar events, adding/listing/searching contacts, or sending notifications."
             ),
             "parameters": {
                 "type": "object",
@@ -1206,8 +1206,11 @@ class CognitionCore:
             "--- GENERIC EXAMPLES ---",
             "User: 'hello there' -> MUST return: [{\"tool_name\": \"chat_response\", \"params\": {\"response_text\": \"Hi! How can I help?\"}}]",
             "User: 'call me a different name' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=a different name\"}}]",
+            "User: 'my name is Skye' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=Skye\"}}]",
+            "User: 'you can call me Master' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity set_preferred_name name=Master\"}}]",
             "User: 'remind me to check the oven' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"notify\", \"details\": {\"message\": \"Reminder: check the oven\"}}}]",
-            "User: 'who is on my contact list?' -> MUST return: [{\"tool_name\": \"security_command\", \"params\": {\"command\": \"identity list\"}}]",
+            "User: 'who is on my contact list?' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"contact.list\", \"details\": {}}}]",
+            "User: 'do you know Yash?' -> MUST return: [{\"tool_name\": \"autonomy_action\", \"params\": {\"action_type\": \"contact.search\", \"details\": {\"name\": \"Yash\"}}}]",
             "--- END EXAMPLES ---",
             "Always respond with a JSON list."
         ]
