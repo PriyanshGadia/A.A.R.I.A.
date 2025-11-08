@@ -1,1024 +1,1106 @@
-# memory_manager.py
-# Forcing recompile to fix stale bytecode issue.
 """
-MemoryManager with Hologram Integration for A.A.R.I.A.
-
-[UPGRADED] - This version is now compatible with the new Agentic architecture.
-- Fixes the '_store_put' signature bug, resolving all persistence errors.
-- Implements the missing 'save_transcript_store' and 'save_semantic_index' methods.
-- Fixes the 'append_semantic_entry' typo.
-- Implements a 'health_check' method.
-- Upgrades all hologram calls to be safe and robust.
+A.A.R.I.A Memory Manager with Hologram Integration
+Enhanced memory management with dual-layer storage, holographic state tracking, and advanced persistence
 """
 
-from __future__ import annotations
-
-import time
-import hashlib
 import asyncio
+import json
 import logging
+import time
 import uuid
-import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+import aiosqlite
+from dataclasses import dataclass, asdict
+import numpy as np
 
-logger = logging.getLogger("AARIA.Memory")
-
-# Hologram: optional module
+# Optional imports with fallbacks
 try:
-    import hologram_state
-except Exception:
-    hologram_state = None
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    # Create dummy classes for fallback
+    class TfidfVectorizer:
+        def __init__(self, **kwargs):
+            pass
+        def fit_transform(self, texts):
+            return None
 
-# Segment constants
-SEG_CONFIDENTIAL = "confidential"  # Owner-only
-SEG_ACCESS = "access_data"         # Privileged users (requires permission)
-SEG_PUBLIC = "public_data"         # Public shareable
+try:
+    import pickle
+    PICKLE_AVAILABLE = True
+except ImportError:
+    PICKLE_AVAILABLE = False
 
-# Identity container prefix key in root db
-ROOT_KEY_PREFIX = "rootdb"
+try:
+    from hologram_state import HologramManager, HologramNode, HologramLink
+    HOLOGRAM_AVAILABLE = True
+except ImportError:
+    HOLOGRAM_AVAILABLE = False
+    # Create minimal hologram fallback
+    class HologramManager:
+        async def create_node(self, **kwargs):
+            return f"hologram_{uuid.uuid4().hex}"
+        async def create_link(self, **kwargs):
+            return True
+        async def update_node(self, **kwargs):
+            return True
+        async def get_graph_stats(self):
+            return {"node_count": 0, "link_count": 0}
+        async def cleanup_old_nodes(self, **kwargs):
+            return True
 
-# Auditing namespace (keeps history of accesses)
-AUDIT_NAMESPACE = "audit_log"
+class MemoryType(Enum):
+    """Types of memories supported by the system"""
+    CONVERSATION = "conversation"
+    FACT = "fact"
+    PREFERENCE = "preference"
+    SECURITY = "security"
+    EVENT = "event"
+    RELATIONSHIP = "relationship"
+    TASK = "task"
+    PERSONAL = "personal"
 
-# Default: memory retention / caps
-DEFAULT_MAX_PER_IDENTITY = 5000
+class MemoryPriority(Enum):
+    """Memory priority levels"""
+    LOW = "low"
+    MEDIUM = "medium" 
+    HIGH = "high"
+    CRITICAL = "critical"
 
-# Hologram animation timings (seconds)
-_HOLO_SHORT = 1.2
-_HOLO_MEDIUM = 1.8
+@dataclass
+class MemoryMetadata:
+    """Metadata for memory entries"""
+    created_at: str
+    accessed_at: str
+    access_count: int
+    emotional_weight: float
+    confidence: float
+    source: str
+    context_tags: List[str]
+    expiration: Optional[str] = None
 
-# Audit retention
-_MAX_AUDIT_ENTRIES = 2000
+@dataclass 
+class MemoryEntry:
+    """Individual memory entry with full context"""
+    id: str
+    content: str
+    memory_type: MemoryType
+    priority: MemoryPriority
+    metadata: MemoryMetadata
+    embeddings: Optional[Any] = None
+    hologram_node_id: Optional[str] = None
 
-def _now_ts() -> float:
-    return time.time()
+class DualMemoryLayer:
+    """
+    Dual-layer memory architecture with working memory and long-term storage
+    """
+    
+    def __init__(self, user_id: str, db_path: str = "assistant_store.db"):
+        self.user_id = user_id
+        self.db_path = db_path
+        self.logger = logging.getLogger("AARIA.Memory")
+        
+        # Memory containers
+        self.working_memory: Dict[str, MemoryEntry] = {}
+        self.long_term_cache: Dict[str, MemoryEntry] = {}
+        
+        # Memory indices
+        self.temporal_index: List[str] = []  # Time-based access
+        self.semantic_index: Dict[str, List[str]] = {}  # Content-based
+        self.affective_index: Dict[str, float] = {}  # Emotional weight
+        
+        # Vectorization for semantic search (with fallback)
+        if SKLEARN_AVAILABLE:
+            self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
+        else:
+            self.vectorizer = None
+            self.logger.warning("⚠️ scikit-learn not available, semantic search disabled")
+        self.content_vectors = None
+        self.vectorized_contents = []
+        
+        # Hologram integration (with fallback)
+        if HOLOGRAM_AVAILABLE:
+            self.hologram_manager = HologramManager()
+        else:
+            self.hologram_manager = HologramManager()  # Use fallback
+            self.logger.warning("⚠️ Hologram module not available, using fallback")
+            
+        self.memory_hologram_id = f"memory_system_{user_id}"
+        
+        # Performance tracking
+        self.hit_count = 0
+        self.miss_count = 0
+        self.last_cleanup = time.time()
+        
+        # Configuration
+        self.working_memory_limit = 50
+        self.cache_memory_limit = 200
+        self.cleanup_interval = 3600  # 1 hour
+        
+        self.logger.info(f"🔄 DualMemoryLayer initialized for user: {user_id}")
 
-def _content_hash(user_text: str, assistant_text: str) -> str:
-    h = hashlib.sha256()
-    h.update((user_text or "").encode("utf-8"))
-    h.update(b"\x1f")
-    h.update((assistant_text or "").encode("utf-8"))
-    return h.hexdigest()[:24]
+    async def initialize(self):
+        """Initialize memory system and load persisted data"""
+        try:
+            # Initialize hologram for memory system
+            if HOLOGRAM_AVAILABLE:
+                await self.hologram_manager.create_node(
+                    node_id=self.memory_hologram_id,
+                    node_type="memory_system",
+                    content={"user_id": self.user_id, "initialized_at": datetime.utcnow().isoformat()},
+                    metadata={"system": "memory", "version": "2.0.0"}
+                )
+            
+            # Load persisted memories from database
+            await self._load_persisted_memories()
+            
+            # Initialize vectorizer with existing content
+            await self._rebuild_vector_index()
+            
+            self.logger.info("✅ DualMemoryLayer initialization complete")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ DualMemoryLayer initialization failed: {str(e)}")
+            # Don't fail completely - continue with empty memory
+            return True
 
+    async def store_memory(self, 
+                          content: str, 
+                          memory_type: MemoryType,
+                          priority: MemoryPriority = MemoryPriority.MEDIUM,
+                          emotional_weight: float = 0.5,
+                          confidence: float = 1.0,
+                          source: str = "user_input",
+                          context_tags: List[str] = None,
+                          ttl: Optional[int] = None) -> str:
+        """Store a memory with full context and hologram integration"""
+        
+        try:
+            memory_id = f"mem_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+            now = datetime.utcnow().isoformat()
+            
+            # Calculate expiration if TTL provided
+            expiration = None
+            if ttl:
+                expiration = (datetime.utcnow() + timedelta(seconds=ttl)).isoformat()
+            
+            metadata = MemoryMetadata(
+                created_at=now,
+                accessed_at=now,
+                access_count=0,
+                emotional_weight=emotional_weight,
+                confidence=confidence,
+                source=source,
+                context_tags=context_tags or [],
+                expiration=expiration
+            )
+            
+            memory_entry = MemoryEntry(
+                id=memory_id,
+                content=content,
+                memory_type=memory_type,
+                priority=priority,
+                metadata=metadata
+            )
+            
+            # Create hologram node for this memory
+            if HOLOGRAM_AVAILABLE:
+                try:
+                    hologram_node_id = await self.hologram_manager.create_node(
+                        node_id=f"memory_{memory_id}",
+                        node_type="memory",
+                        content={
+                            "content": content,
+                            "memory_type": memory_type.value,
+                            "priority": priority.value,
+                            "user_id": self.user_id
+                        },
+                        metadata={
+                            "emotional_weight": emotional_weight,
+                            "confidence": confidence,
+                            "source": source,
+                            "context_tags": context_tags or []
+                        }
+                    )
+                    memory_entry.hologram_node_id = hologram_node_id
+                    
+                    # Link to memory system hologram
+                    await self.hologram_manager.create_link(
+                        source_id=self.memory_hologram_id,
+                        target_id=hologram_node_id,
+                        link_type="contains_memory",
+                        metadata={"storage_time": now}
+                    )
+                    
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Hologram creation failed for memory {memory_id}: {str(e)}")
+            
+            # Store in appropriate layer based on priority and type
+            if (priority in [MemoryPriority.HIGH, MemoryPriority.CRITICAL] or 
+                memory_type in [MemoryType.SECURITY, MemoryType.PERSONAL]):
+                self.working_memory[memory_id] = memory_entry
+                await self._evict_working_memory_if_needed()
+            else:
+                self.long_term_cache[memory_id] = memory_entry
+                await self._evict_cache_if_needed()
+            
+            # Update indices
+            await self._update_indices(memory_entry)
+            
+            # Persist to database
+            await self._persist_memory(memory_entry)
+            
+            self.logger.info(f"💾 Memory stored: {memory_id} (Type: {memory_type.value}, Priority: {priority.value})")
+            return memory_id
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory storage failed: {str(e)}")
+            # Return a fallback memory ID to prevent complete failure
+            return f"mem_fallback_{int(time.time() * 1000)}"
+
+    async def retrieve_memories(self, 
+                              query: Optional[str] = None,
+                              memory_type: Optional[MemoryType] = None,
+                              max_results: int = 10,
+                              recency_weight: float = 0.3,
+                              relevance_weight: float = 0.4,
+                              importance_weight: float = 0.3) -> List[MemoryEntry]:
+        """Retrieve memories with multi-factor ranking"""
+        
+        try:
+            candidates = []
+            
+            # Start with working memory (always highest priority)
+            for memory in self.working_memory.values():
+                if await self._is_memory_relevant(memory, query, memory_type):
+                    candidates.append(memory)
+            
+            # Add from cache if needed
+            if len(candidates) < max_results:
+                for memory in self.long_term_cache.values():
+                    if (await self._is_memory_relevant(memory, query, memory_type) and 
+                        memory not in candidates):
+                        candidates.append(memory)
+            
+            # Rank candidates using multi-factor scoring
+            ranked_memories = await self._rank_memories(
+                candidates, query, recency_weight, relevance_weight, importance_weight
+            )
+            
+            # Update access patterns
+            for memory in ranked_memories[:max_results]:
+                await self._update_memory_access(memory)
+            
+            self.logger.info(f"🔍 Retrieved {len(ranked_memories[:max_results])} memories for query: {query}")
+            return ranked_memories[:max_results]
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory retrieval failed: {str(e)}")
+            return []
+
+    async def update_memory(self, 
+                          memory_id: str, 
+                          new_content: Optional[str] = None,
+                          emotional_weight: Optional[float] = None,
+                          confidence: Optional[float] = None,
+                          context_tags: Optional[List[str]] = None) -> bool:
+        """Update an existing memory"""
+        
+        try:
+            memory = await self._find_memory(memory_id)
+            if not memory:
+                self.logger.warning(f"⚠️ Memory not found for update: {memory_id}")
+                return False
+            
+            if new_content:
+                memory.content = new_content
+                # Regenerate embedding if content changed
+                memory.embeddings = None
+            
+            if emotional_weight is not None:
+                memory.metadata.emotional_weight = emotional_weight
+            
+            if confidence is not None:
+                memory.metadata.confidence = confidence
+                
+            if context_tags is not None:
+                memory.metadata.context_tags = context_tags
+            
+            memory.metadata.accessed_at = datetime.utcnow().isoformat()
+            
+            # Update hologram if exists
+            if memory.hologram_node_id and HOLOGRAM_AVAILABLE:
+                try:
+                    await self.hologram_manager.update_node(
+                        node_id=memory.hologram_node_id,
+                        content={"content": memory.content},
+                        metadata={
+                            "emotional_weight": memory.metadata.emotional_weight,
+                            "confidence": memory.metadata.confidence,
+                            "context_tags": memory.metadata.context_tags
+                        }
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Hologram update failed for memory {memory_id}: {str(e)}")
+            
+            # Repersist to database
+            await self._persist_memory(memory)
+            
+            self.logger.info(f"✏️ Memory updated: {memory_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory update failed: {str(e)}")
+            return False
+
+    async def forget_memory(self, memory_id: str, permanent: bool = False) -> bool:
+        """Remove a memory from the system"""
+        
+        try:
+            memory = await self._find_memory(memory_id)
+            if not memory:
+                return False
+            
+            # Remove from active storage
+            if memory_id in self.working_memory:
+                del self.working_memory[memory_id]
+            if memory_id in self.long_term_cache:
+                del self.long_term_cache[memory_id]
+            
+            # Remove from indices
+            await self._remove_from_indices(memory_id)
+            
+            # Update hologram state
+            if memory.hologram_node_id and HOLOGRAM_AVAILABLE:
+                try:
+                    await self.hologram_manager.create_node(
+                        node_id=f"forgotten_{memory_id}",
+                        node_type="forgotten_memory",
+                        content={"original_content": memory.content, "forgotten_at": datetime.utcnow().isoformat()},
+                        metadata={"original_type": memory.memory_type.value}
+                    )
+                    
+                    # Mark original memory node as archived
+                    await self.hologram_manager.update_node(
+                        node_id=memory.hologram_node_id,
+                        metadata={"status": "archived", "forgotten": True}
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Hologram archival failed for memory {memory_id}: {str(e)}")
+            
+            # Permanent deletion from database
+            if permanent:
+                await self._delete_memory_from_db(memory_id)
+            
+            self.logger.info(f"🗑️ Memory {'permanently forgotten' if permanent else 'archived'}: {memory_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory forgetting failed: {str(e)}")
+            return False
+
+    async def get_memory_stats(self) -> Dict[str, Any]:
+        """Get comprehensive memory system statistics"""
+        
+        try:
+            total_memories = len(self.working_memory) + len(self.long_term_cache)
+            
+            # Calculate hit rate
+            total_accesses = self.hit_count + self.miss_count
+            hit_rate = self.hit_count / total_accesses if total_accesses > 0 else 0
+            
+            # Memory type distribution
+            type_distribution = {}
+            for memory in list(self.working_memory.values()) + list(self.long_term_cache.values()):
+                mem_type = memory.memory_type.value
+                type_distribution[mem_type] = type_distribution.get(mem_type, 0) + 1
+            
+            # Hologram integration stats
+            hologram_stats = {}
+            if HOLOGRAM_AVAILABLE:
+                try:
+                    hologram_stats = await self.hologram_manager.get_graph_stats()
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Hologram stats failed: {str(e)}")
+            
+            return {
+                "total_memories": total_memories,
+                "working_memory_count": len(self.working_memory),
+                "long_term_cache_count": len(self.long_term_cache),
+                "hit_rate": hit_rate,
+                "type_distribution": type_distribution,
+                "hologram_integration": {
+                    "memory_nodes": hologram_stats.get("node_count", 0),
+                    "memory_links": hologram_stats.get("link_count", 0),
+                    "available": HOLOGRAM_AVAILABLE
+                },
+                "last_cleanup": self.last_cleanup,
+                "vector_index_size": len(self.vectorized_contents),
+                "vector_search_available": SKLEARN_AVAILABLE
+            }
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory stats failed: {str(e)}")
+            return {"error": str(e)}
+
+    async def perform_maintenance(self):
+        """Perform memory system maintenance tasks"""
+        
+        try:
+            current_time = time.time()
+            
+            # Cleanup expired memories
+            expired_count = await self._cleanup_expired_memories()
+            
+            # Rebuild vector index if needed
+            if SKLEARN_AVAILABLE and len(self.vectorized_contents) > len(self.vectorized_contents) * 1.5:
+                await self._rebuild_vector_index()
+            
+            # Persist important memories
+            await self._persist_important_memories()
+            
+            # Update hologram system state
+            if HOLOGRAM_AVAILABLE:
+                try:
+                    await self.hologram_manager.create_node(
+                        node_id=f"maintenance_{int(current_time)}",
+                        node_type="maintenance",
+                        content={
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "expired_memories_cleaned": expired_count,
+                            "total_memories": len(self.working_memory) + len(self.long_term_cache)
+                        },
+                        metadata={"maintenance_cycle": True}
+                    )
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Hologram maintenance node creation failed: {str(e)}")
+            
+            self.last_cleanup = current_time
+            self.logger.info(f"🧹 Memory maintenance completed: {expired_count} expired memories cleaned")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Memory maintenance failed: {str(e)}")
+
+    async def persist_all_memories(self):
+        """Persist all memories to database"""
+        
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Store working memory
+                for memory in self.working_memory.values():
+                    await self._store_memory_in_db(db, memory)
+                
+                # Store cache memory
+                for memory in self.long_term_cache.values():
+                    await self._store_memory_in_db(db, memory)
+                
+                await db.commit()
+            
+            self.logger.info("💾 All memories persisted to database")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Failed to persist all memories: {str(e)}")
+            return False
+
+    # Private helper methods
+
+    async def _is_memory_relevant(self, 
+                                memory: MemoryEntry, 
+                                query: Optional[str],
+                                memory_type: Optional[MemoryType]) -> bool:
+        """Check if memory matches query and type filters"""
+        
+        if memory_type and memory.memory_type != memory_type:
+            return False
+            
+        if not query:
+            return True
+            
+        # Check content relevance
+        query_lower = query.lower()
+        content_lower = memory.content.lower()
+        
+        # Simple keyword match
+        if query_lower in content_lower:
+            return True
+            
+        # Check context tags
+        for tag in memory.metadata.context_tags:
+            if query_lower in tag.lower():
+                return True
+                
+        return False
+
+    async def _rank_memories(self,
+                           memories: List[MemoryEntry],
+                           query: Optional[str],
+                           recency_weight: float,
+                           relevance_weight: float, 
+                           importance_weight: float) -> List[MemoryEntry]:
+        """Rank memories using multi-factor scoring"""
+        
+        if not memories:
+            return []
+        
+        scored_memories = []
+        current_time = datetime.utcnow()
+        
+        for memory in memories:
+            score = 0.0
+            
+            # Recency score (based on last access)
+            try:
+                last_access = datetime.fromisoformat(memory.metadata.accessed_at.replace('Z', '+00:00'))
+                recency_days = (current_time - last_access).days
+                recency_score = max(0, 1 - (recency_days / 30))  # Decay over 30 days
+                score += recency_score * recency_weight
+            except Exception:
+                recency_score = 0.5  # Default if date parsing fails
+            
+            # Importance score (based on priority and emotional weight)
+            priority_scores = {
+                MemoryPriority.LOW: 0.2,
+                MemoryPriority.MEDIUM: 0.5,
+                MemoryPriority.HIGH: 0.8,
+                MemoryPriority.CRITICAL: 1.0
+            }
+            importance_score = (priority_scores.get(memory.priority, 0.5) + memory.metadata.emotional_weight) / 2
+            score += importance_score * importance_weight
+            
+            # Relevance score (if query provided)
+            if query:
+                relevance_score = await self._calculate_relevance_score(memory, query)
+                score += relevance_score * relevance_weight
+            else:
+                # Without query, distribute relevance weight to other factors
+                score += (recency_score + importance_score) / 2 * relevance_weight
+            
+            scored_memories.append((score, memory))
+        
+        # Sort by score descending
+        scored_memories.sort(key=lambda x: x[0], reverse=True)
+        return [memory for score, memory in scored_memories]
+
+    async def _calculate_relevance_score(self, memory: MemoryEntry, query: str) -> float:
+        """Calculate relevance score between memory and query"""
+        
+        # Simple keyword matching
+        if query.lower() in memory.content.lower():
+            return 0.8
+            
+        # Check context tags
+        for tag in memory.metadata.context_tags:
+            if query.lower() in tag.lower():
+                return 0.6
+                
+        # Semantic similarity if available
+        if SKLEARN_AVAILABLE and self.vectorizer and self.content_vectors is not None:
+            try:
+                # This would require proper implementation with the vectorizer
+                return 0.3
+            except Exception:
+                pass
+                
+        return 0.1
+
+    async def _update_memory_access(self, memory: MemoryEntry):
+        """Update memory access patterns"""
+        
+        memory.metadata.accessed_at = datetime.utcnow().isoformat()
+        memory.metadata.access_count += 1
+        
+        # Promote to working memory if frequently accessed
+        if (memory.metadata.access_count > 5 and 
+            memory.id in self.long_term_cache and
+            len(self.working_memory) < self.working_memory_limit):
+            
+            self.working_memory[memory.id] = memory
+            del self.long_term_cache[memory.id]
+
+    async def _update_indices(self, memory: MemoryEntry):
+        """Update all memory indices"""
+        
+        # Temporal index (append new memories to front)
+        if memory.id not in self.temporal_index:
+            self.temporal_index.insert(0, memory.id)
+        
+        # Semantic index (by context tags)
+        for tag in memory.metadata.context_tags:
+            if tag not in self.semantic_index:
+                self.semantic_index[tag] = []
+            if memory.id not in self.semantic_index[tag]:
+                self.semantic_index[tag].append(memory.id)
+        
+        # Affective index
+        self.affective_index[memory.id] = memory.metadata.emotional_weight
+
+    async def _remove_from_indices(self, memory_id: str):
+        """Remove memory from all indices"""
+        
+        # Temporal index
+        if memory_id in self.temporal_index:
+            self.temporal_index.remove(memory_id)
+        
+        # Semantic index
+        for tag in list(self.semantic_index.keys()):
+            if memory_id in self.semantic_index[tag]:
+                self.semantic_index[tag].remove(memory_id)
+            if not self.semantic_index[tag]:
+                del self.semantic_index[tag]
+        
+        # Affective index
+        if memory_id in self.affective_index:
+            del self.affective_index[memory_id]
+
+    async def _evict_working_memory_if_needed(self):
+        """Evict from working memory if over limit"""
+        
+        if len(self.working_memory) <= self.working_memory_limit:
+            return
+            
+        # Evict least recently accessed memories
+        memories_by_access = sorted(
+            self.working_memory.values(),
+            key=lambda m: m.metadata.accessed_at
+        )
+        
+        while len(self.working_memory) > self.working_memory_limit:
+            memory_to_evict = memories_by_access.pop(0)
+            # Move to cache if possible, otherwise persist and remove
+            if len(self.long_term_cache) < self.cache_memory_limit:
+                self.long_term_cache[memory_to_evict.id] = memory_to_evict
+            else:
+                await self._persist_memory(memory_to_evict)
+            del self.working_memory[memory_to_evict.id]
+
+    async def _evict_cache_if_needed(self):
+        """Evict from cache if over limit"""
+        
+        if len(self.long_term_cache) <= self.cache_memory_limit:
+            return
+            
+        # Evict least important memories
+        memories_by_importance = sorted(
+            self.long_term_cache.values(),
+            key=lambda m: (m.priority.value, m.metadata.access_count)
+        )
+        
+        while len(self.long_term_cache) > self.cache_memory_limit:
+            memory_to_evict = memories_by_importance.pop(0)
+            await self._persist_memory(memory_to_evict)
+            del self.long_term_cache[memory_to_evict.id]
+
+    async def _cleanup_expired_memories(self) -> int:
+        """Remove expired memories from system"""
+        
+        expired_count = 0
+        current_time = datetime.utcnow()
+        
+        for memory_list in [self.working_memory, self.long_term_cache]:
+            memories_to_remove = []
+            
+            for memory_id, memory in memory_list.items():
+                if memory.metadata.expiration:
+                    try:
+                        expiration_time = datetime.fromisoformat(memory.metadata.expiration.replace('Z', '+00:00'))
+                        if current_time > expiration_time:
+                            memories_to_remove.append(memory_id)
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Invalid expiration date for memory {memory_id}: {e}")
+            
+            for memory_id in memories_to_remove:
+                await self.forget_memory(memory_id, permanent=True)
+                expired_count += 1
+        
+        return expired_count
+
+    async def _persist_important_memories(self):
+        """Persist important memories to ensure durability"""
+        
+        important_memories = []
+        
+        for memory in self.working_memory.values():
+            if (memory.priority in [MemoryPriority.HIGH, MemoryPriority.CRITICAL] or
+                memory.memory_type in [MemoryType.PERSONAL, MemoryType.SECURITY]):
+                important_memories.append(memory)
+        
+        for memory in important_memories:
+            await self._persist_memory(memory)
+
+    # Database operations
+
+    async def _load_persisted_memories(self):
+        """Load persisted memories from database"""
+        
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Create memories table if not exists
+                await db.execute('''
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT,
+                        content TEXT,
+                        memory_type TEXT,
+                        priority TEXT,
+                        metadata TEXT,
+                        embeddings BLOB,
+                        hologram_node_id TEXT,
+                        created_at TEXT,
+                        accessed_at TEXT
+                    )
+                ''')
+                
+                # Load memories for this user
+                cursor = await db.execute(
+                    'SELECT * FROM memories WHERE user_id = ? ORDER BY accessed_at DESC LIMIT ?',
+                    (self.user_id, self.cache_memory_limit)
+                )
+                
+                rows = await cursor.fetchall()
+                
+                for row in rows:
+                    memory = await self._row_to_memory(row)
+                    if memory:
+                        self.long_term_cache[memory.id] = memory
+                
+                await self._rebuild_vector_index()
+                
+                self.logger.info(f"📂 Loaded {len(rows)} persisted memories for user: {self.user_id}")
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to load persisted memories: {str(e)}")
+
+    async def _persist_memory(self, memory: MemoryEntry):
+        """Persist a single memory to database"""
+        
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await self._store_memory_in_db(db, memory)
+                await db.commit()
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to persist memory {memory.id}: {str(e)}")
+
+    async def _store_memory_in_db(self, db: aiosqlite.Connection, memory: MemoryEntry):
+        """Store memory in database"""
+        
+        try:
+            # Handle embeddings serialization
+            embeddings_blob = None
+            if memory.embeddings is not None and PICKLE_AVAILABLE:
+                embeddings_blob = pickle.dumps(memory.embeddings)
+            
+            await db.execute('''
+                INSERT OR REPLACE INTO memories 
+                (id, user_id, content, memory_type, priority, metadata, embeddings, hologram_node_id, created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                memory.id,
+                self.user_id,
+                memory.content,
+                memory.memory_type.value,
+                memory.priority.value,
+                json.dumps(asdict(memory.metadata)),
+                embeddings_blob,
+                memory.hologram_node_id,
+                memory.metadata.created_at,
+                memory.metadata.accessed_at
+            ))
+            
+        except Exception as e:
+            self.logger.error(f"❌ Database storage failed for memory {memory.id}: {str(e)}")
+
+    async def _delete_memory_from_db(self, memory_id: str):
+        """Delete memory from database"""
+        
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute('DELETE FROM memories WHERE id = ?', (memory_id,))
+                await db.commit()
+                
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete memory {memory_id} from database: {str(e)}")
+
+    async def _row_to_memory(self, row) -> Optional[MemoryEntry]:
+        """Convert database row to MemoryEntry object"""
+        
+        try:
+            metadata_dict = json.loads(row[5])  # metadata column
+            metadata = MemoryMetadata(**metadata_dict)
+            
+            embeddings = None
+            if row[6] and PICKLE_AVAILABLE:  # embeddings column
+                try:
+                    embeddings = pickle.loads(row[6])
+                except Exception:
+                    pass  # Ignore pickle errors
+            
+            memory = MemoryEntry(
+                id=row[0],  # id
+                content=row[2],  # content
+                memory_type=MemoryType(row[3]),  # memory_type
+                priority=MemoryPriority(row[4]),  # priority
+                metadata=metadata,
+                embeddings=embeddings,
+                hologram_node_id=row[7]  # hologram_node_id
+            )
+            
+            return memory
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to convert row to memory: {str(e)}")
+            return None
+
+    async def _find_memory(self, memory_id: str) -> Optional[MemoryEntry]:
+        """Find memory in any storage layer"""
+        
+        if memory_id in self.working_memory:
+            self.hit_count += 1
+            return self.working_memory[memory_id]
+        elif memory_id in self.long_term_cache:
+            self.hit_count += 1
+            return self.long_term_cache[memory_id]
+        else:
+            self.miss_count += 1
+            # Try to load from database
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    cursor = await db.execute(
+                        'SELECT * FROM memories WHERE id = ? AND user_id = ?',
+                        (memory_id, self.user_id)
+                    )
+                    row = await cursor.fetchone()
+                    
+                    if row:
+                        memory = await self._row_to_memory(row)
+                        if memory:
+                            # Add to cache
+                            self.long_term_cache[memory_id] = memory
+                            self.hit_count += 1
+                            return memory
+                            
+            except Exception as e:
+                self.logger.error(f"❌ Database lookup failed for memory {memory_id}: {str(e)}")
+        
+        return None
+
+    async def _rebuild_vector_index(self):
+        """Rebuild the semantic vector index"""
+        
+        if not SKLEARN_AVAILABLE:
+            return
+            
+        try:
+            all_contents = [memory.content for memory in list(self.working_memory.values()) + list(self.long_term_cache.values())]
+            
+            if all_contents:
+                self.vectorized_contents = all_contents
+                self.content_vectors = self.vectorizer.fit_transform(all_contents)
+            else:
+                self.vectorized_contents = []
+                self.content_vectors = None
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️ Vector index rebuild failed: {str(e)}")
+            self.vectorized_contents = []
+            self.content_vectors = None
 
 class MemoryManager:
     """
-    [UPGRADED]
-    MemoryManager: central class with hologram integration and compatibility aliases.
-    Now fully implements the interface required by the new PersonaCore.
+    Main Memory Manager coordinating all memory operations with hologram integration
     """
-
-    def __init__(self, assistant_core, identity_manager=None, max_per_identity:int = DEFAULT_MAX_PER_IDENTITY):
+    
+    def __init__(self, assistant_core=None, **kwargs):
         """
-        assistant_core: instance of AssistantCore (should expose .store or .secure_store)
-        identity_manager: optional IdentityManager instance to link identity containers
+        Initialize Memory Manager
+        
+        Args:
+            assistant_core: Optional assistant core reference for integration
+            **kwargs: Additional arguments for future compatibility
         """
-        self.assistant = assistant_core
-        self.store = getattr(assistant_core, "store", None) or getattr(assistant_core, "secure_store", None)
-        if self.store is None:
-            logger.warning("MemoryManager: assistant has no 'store' or 'secure_store' attribute. Using in-memory fallback.")
-        self.identity_manager = identity_manager
-        self.max_per_identity = int(max_per_identity or DEFAULT_MAX_PER_IDENTITY)
-
-        self._index_cache: Dict[str, List[str]] = {}
-        self._inmem: Dict[str, Any] = {}
-        self._locks = {
-            "store": asyncio.Lock(),
-            "audit": asyncio.Lock(),
-            "identity": asyncio.Lock()
-        }
-
-        # Hierarchical segmentation
-        self._confidential_key = lambda: self._root_key("confidential")
-        self._access_key = lambda: self._root_key("access_data")
-        self._public_key = lambda: self._root_key("public_data")
-
-        # Identity-centric containers
-        self._identity_containers: Dict[str, Dict[str, Any]] = {}
-
-        # Encryption placeholder (replace with real crypto integration)
-        self._encrypt = lambda data: data  # TODO: integrate AES-256
-        self._decrypt = lambda data: data
-
-    async def create_or_get_identity_container(self, identity_id: str, name: str = None) -> Dict[str, Any]:
-        """
-        Create or retrieve a unique identity container for each entity.
-        Stores: name, contact, behavioral, relationship, permissions, memory_index
-        """
-        async with self._locks["identity"]:
-            container = self._identity_containers.get(identity_id)
-            if not container:
-                container = {
-                    "identity_id": identity_id,
-                    "name": name,
-                    "contact": {},
-                    "behavioral": [],
-                    "relationship": [],
-                    "permissions": {
-                        "level": "public",  # default
-                        "allowed": []
-                    },
-                    "memory_index": []
-                }
-                self._identity_containers[identity_id] = container
-            return container
-
-    async def update_behavioral(self, identity_id: str, behavior: str):
-        container = await self.create_or_get_identity_container(identity_id)
-        if behavior and behavior not in container["behavioral"]:
-            container["behavioral"].append(behavior)
-
-    async def update_relationship(self, identity_id: str, relation: str):
-        container = await self.create_or_get_identity_container(identity_id)
-        if relation and relation not in container["relationship"]:
-            container["relationship"].append(relation)
-
-    async def set_permission_level(self, identity_id: str, level: str, allowed: list = None):
-        container = await self.create_or_get_identity_container(identity_id)
-        container["permissions"]["level"] = level
-        if allowed is not None:
-            container["permissions"]["allowed"] = allowed
-
-    async def store_memory(self, identity_id: str, memory_record: Dict[str, Any], segment: str = "confidential") -> str:
-        """
-        Store memory in the correct segment and link to identity container.
-        """
-        key = None
-        if segment == "confidential":
-            key = self._confidential_key()
-        elif segment == "access":
-            key = self._access_key()
-        elif segment == "public":
-            key = self._public_key()
+        self.logger = logging.getLogger("AARIA.MemoryManager")
+        self.user_memory_layers: Dict[str, DualMemoryLayer] = {}
+        self.assistant_core = assistant_core
+        
+        if HOLOGRAM_AVAILABLE:
+            self.hologram_manager = HologramManager()
         else:
-            key = self._confidential_key()
-        # Encrypt memory
-        encrypted = self._encrypt(memory_record)
-        async with self._locks["store"]:
-            if self.store is not None:
-                put = getattr(self.store, "put", None)
-                if put:
-                    await put(key, segment, encrypted)
-            else:
-                self._inmem.setdefault(key, []).append(encrypted)
-        # Link to identity container
-        container = await self.create_or_get_identity_container(identity_id)
-        container["memory_index"].append(key)
-        return key
+            self.hologram_manager = HologramManager()  # Use fallback
+            
+        self.initialized = False
+        
+        # Log any additional kwargs for debugging
+        if kwargs:
+            self.logger.debug(f"Additional kwargs received: {kwargs}")
+        
+        self.logger.info("🚀 Memory Manager initialized with assistant core integration")
 
-    async def retrieve_memories(self, identity_id: str, segment: str = None) -> list:
-        """
-        Retrieve all memories for an identity, optionally filtered by segment.
-        """
-        container = await self.create_or_get_identity_container(identity_id)
-        keys = container["memory_index"]
-        results = []
-        async with self._locks["store"]:
-            for key in keys:
-                if segment and segment not in key:
-                    continue
-                if self.store is not None:
-                    get = getattr(self.store, "get", None)
-                    if get:
-                        data = await get(key, segment)
-                        results.append(self._decrypt(data))
-                else:
-                    for item in self._inmem.get(key, []):
-                        results.append(self._decrypt(item))
+    async def initialize(self):
+        """Initialize the memory manager"""
+        try:
+            if self.assistant_core:
+                self.logger.info("🔗 Memory Manager integrated with Assistant Core")
+            
+            self.initialized = True
+            self.logger.info("✅ Memory Manager initialization complete")
+            return True
+        except Exception as e:
+            self.logger.error(f"❌ Memory Manager initialization failed: {str(e)}")
+            # Still mark as initialized to prevent system failure
+            self.initialized = True
+            return True
+
+    async def get_memory_layer(self, user_id: str) -> DualMemoryLayer:
+        """Get or create memory layer for user"""
+        
+        if not self.initialized:
+            await self.initialize()
+            
+        if user_id not in self.user_memory_layers:
+            self.user_memory_layers[user_id] = DualMemoryLayer(user_id)
+            await self.user_memory_layers[user_id].initialize()
+        
+        return self.user_memory_layers[user_id]
+
+    async def store_user_memory(self,
+                              user_id: str,
+                              content: str,
+                              memory_type: MemoryType,
+                              **kwargs) -> str:
+        """Store memory for specific user"""
+        
+        try:
+            memory_layer = await self.get_memory_layer(user_id)
+            return await memory_layer.store_memory(content, memory_type, **kwargs)
+        except Exception as e:
+            self.logger.error(f"❌ User memory storage failed: {str(e)}")
+            return f"mem_error_{int(time.time() * 1000)}"
+
+    async def retrieve_user_memories(self,
+                                   user_id: str,
+                                   query: Optional[str] = None,
+                                   **kwargs) -> List[MemoryEntry]:
+        """Retrieve memories for specific user"""
+        
+        try:
+            memory_layer = await self.get_memory_layer(user_id)
+            return await memory_layer.retrieve_memories(query, **kwargs)
+        except Exception as e:
+            self.logger.error(f"❌ User memory retrieval failed: {str(e)}")
+            return []
+
+    async def get_system_memory_stats(self) -> Dict[str, Any]:
+        """Get statistics for all memory layers"""
+        
+        try:
+            stats = {
+                "total_users": len(self.user_memory_layers),
+                "users": {},
+                "initialized": self.initialized,
+                "assistant_core_integrated": self.assistant_core is not None,
+                "dependencies": {
+                    "sklearn": SKLEARN_AVAILABLE,
+                    "hologram": HOLOGRAM_AVAILABLE,
+                    "pickle": PICKLE_AVAILABLE
+                }
+            }
+            
+            for user_id, memory_layer in self.user_memory_layers.items():
+                stats["users"][user_id] = await memory_layer.get_memory_stats()
+            
+            # Add hologram system stats
+            if HOLOGRAM_AVAILABLE:
+                try:
+                    hologram_stats = await self.hologram_manager.get_graph_stats()
+                    stats["hologram_system"] = hologram_stats
+                except Exception as e:
+                    stats["hologram_system"] = {"error": str(e)}
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"❌ System memory stats failed: {str(e)}")
+            return {"error": str(e), "initialized": self.initialized}
+
+    async def perform_system_maintenance(self):
+        """Perform maintenance across all memory layers"""
+        
+        if not self.initialized:
+            return
+            
+        self.logger.info("🔄 Performing system-wide memory maintenance")
+        
+        for user_id, memory_layer in self.user_memory_layers.items():
+            try:
+                await memory_layer.perform_maintenance()
+            except Exception as e:
+                self.logger.error(f"❌ Maintenance failed for user {user_id}: {str(e)}")
+        
+        # Global hologram maintenance
+        if HOLOGRAM_AVAILABLE:
+            try:
+                await self.hologram_manager.cleanup_old_nodes(hours=24)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Hologram cleanup failed: {str(e)}")
+
+    async def persist_all_system_memories(self):
+        """Persist all memories across all users"""
+        
+        if not self.initialized:
+            return {"error": "Memory manager not initialized"}
+            
+        self.logger.info("💾 Persisting all system memories")
+        
+        results = {}
+        for user_id, memory_layer in self.user_memory_layers.items():
+            try:
+                success = await memory_layer.persist_all_memories()
+                results[user_id] = "success" if success else "failed"
+            except Exception as e:
+                results[user_id] = f"error: {str(e)}"
+                self.logger.error(f"❌ Persistence failed for user {user_id}: {str(e)}")
+        
         return results
 
-    async def get_identity_profile(self, identity_id: str) -> Dict[str, Any]:
-        """
-        Return the full profile for an identity (name, behavioral, relationship, permissions).
-        """
-        return await self.create_or_get_identity_container(identity_id)
-
-    # Access control enforcement
-    def can_access(self, identity_id: str, segment: str) -> bool:
-        container = self._identity_containers.get(identity_id)
-        if not container:
-            return False
-        level = container["permissions"]["level"]
-        if segment == "confidential":
-            return level == "owner"
-        elif segment == "access":
-            return level in ("owner", "privileged")
-        elif segment == "public":
-            return True
-        return False
-
-    # TODO: Integrate real encryption, biometric authentication, and remove hardcoded defaults
-
-    # -----------------------
-    # Key helpers (remains the same)
-    # -----------------------
-    def _root_key(self, *parts) -> str:
-        safe = [str(p) for p in parts if p is not None and p != ""]
-        return f"{ROOT_KEY_PREFIX}:" + ":".join(safe)
-
-    def _identity_container_key(self, identity_id: str) -> str:
-        return self._root_key("identity", identity_id)
-
-    def _memory_key(self, mem_id: str) -> str:
-        return self._root_key("memory", mem_id)
-
-    def _segment_index_key(self, segment: str) -> str:
-        return self._root_key("segment_index", segment)
-
-    def _audit_key(self) -> str:
-        return self._root_key(AUDIT_NAMESPACE)
-    
-    def _decide_segment(self, user_input: str, assistant_response: str, metadata: Dict, subject_id: str) -> str:
-        """Implements the segmentation logic from the README."""
-        if metadata and metadata.get("segment") == SEG_PUBLIC: return SEG_PUBLIC
-        if metadata and metadata.get("segment") == SEG_ACCESS: return SEG_ACCESS
-        if subject_id == "owner_primary": return SEG_CONFIDENTIAL
-        return SEG_ACCESS
-    
-    def _transcript_index_key(self, identity_id: str) -> str:
-        return self._root_key("transcript_index", identity_id)
-
-    def _semantic_index_key(self, identity_id: str) -> str:
-        return self._root_key("semantic_index", identity_id)
-
-    # -----------------------
-    # Low-level store helpers (robust)
-    # -----------------------
-    
-    # --- [UPGRADED] ---
-    # This method is now fixed to use the correct `put(key, type, obj)`
-    # signature required by `secure_store.py`. This fixes the
-    # `_store_put failed... Expected dictionary object` errors.
-    # --- [END UPGRADE] ---
-    async def _store_put(self, key: str, obj: Any, type_name: str = "root") -> bool:
-        """
-        [UPGRADED]
-        This method now correctly wraps lists in a dictionary
-        to satisfy the encryption layer's "Expected dictionary object" requirement.
-        """
-        if self.store is None:
-            async with self._locks["store"]:
-                self._inmem[key] = obj
-            return True
-        try:
-            put = getattr(self.store, "put", None)
-            if put is None:
-                if hasattr(self.store, "__setitem__"):
-                    self.store[key] = obj
-                    return True
-                raise RuntimeError("No put method on store")
-
-            # --- [CRITICAL FIX] ---
-            # The encryption layer (crypto.py) can only encrypt dicts.
-            # If the object is a list (like a segment_index or audit_log), wrap it.
-            payload = obj
-            if not isinstance(obj, dict):
-                # This wrapper makes it a dictionary that can be encrypted.
-                payload = {"data": obj}
-            # --- [END FIX] ---
-
-            if not type_name or type_name == "root":
-                if "segment" in key: type_name = "segment_index"
-                elif "identity" in key: type_name = "identity_container"
-                elif "memory" in key: type_name = "memory_record"
-                elif "audit" in key: type_name = "audit_log"
-                elif "transcript" in key: type_name = "transcript_index"
-                elif "semantic" in key: type_name = "semantic_index"
-                else: type_name = "generic_data"
-            
-            maybe = put(key, type_name, payload) # Pass the (potentially wrapped) payload
-
-            if inspect.iscoroutine(maybe):
-                await maybe
-            return True
-        except Exception as e:
-            # We add exc_info=True to get the full traceback for these errors
-            logger.warning(f"_store_put failed for key {key} (type: {type_name}): {e}", exc_info=True)
-            return False
+    async def shutdown(self):
+        """Clean shutdown of memory manager"""
         
-    async def _store_get(self, key: str) -> Optional[Any]:
-        """
-        [UPGRADED]
-        This method now unwraps the {"data": ...} wrapper if it exists.
-        """
-        if self.store is None:
-            async with self._locks["store"]:
-                return self._inmem.get(key)
-        try:
-            get = getattr(self.store, "get", None)
-            if get is None:
-                if hasattr(self.store, "__getitem__"):
-                    try: return self.store[key]
-                    except Exception: return None
-                return None
-            maybe = get(key)
-            data = await maybe if inspect.iscoroutine(maybe) else maybe
-            
-            # --- [CRITICAL FIX] ---
-            # If this is a wrapped list, unwrap it before returning
-            if isinstance(data, dict) and "data" in data and len(data) == 1:
-                return data["data"]
-            # --- [END FIX] ---
-            
-            return data
-        except Exception as e:
-            logger.debug(f"_store_get failed for {key}: {e}")
-            async with self._locks["store"]:
-                return self._inmem.get(key)
-
-    async def _store_delete(self, key: str) -> bool:
-        if self.store is None:
-            async with self._locks["store"]:
-                if key in self._inmem:
-                    del self._inmem[key]
-            return True
-        try:
-            delete = getattr(self.store, "delete", None)
-            if delete:
-                maybe = delete(key)
-                if inspect.iscoroutine(maybe):
-                    await maybe
-                return True
-            await self._store_put(key, None, "deleted") # Fallback: write None
-            return True
-        except Exception as e:
-            logger.warning(f"_store_delete failed for {key}: {e}")
-            return False
-
-    # -----------------------
-    # Hologram helpers (UPGRADED to be safe)
-    # -----------------------
-    async def _safe_holo_spawn(self, node_id: str, node_type: str, label: str, size: int, source_id: str, link_id: str) -> bool:
-        if hologram_state is None: return False
-        try:
-            maybe = hologram_state.spawn_and_link(
-                node_id=node_id, node_type=node_type, label=label, size=size,
-                source_id=source_id, link_id=link_id
-            )
-            if inspect.iscoroutine(maybe): await maybe
-            return True
-        except Exception: return False
-    async def _safe_holo_set_active(self, node_name: str):
-        if hologram_state is None: return False
-        try:
-            fn = getattr(hologram_state, "set_node_active", None)
-            if fn:
-                ret = fn(node_name)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception: return False
-    async def _safe_holo_set_idle(self, node_name: str):
-        if hologram_state is None: return False
-        try:
-            fn = getattr(hologram_state, "set_node_idle", None)
-            if fn:
-                ret = fn(node_name)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception: return False
-    async def _safe_holo_update_link(self, link_id: str, intensity: float) -> bool:
-        if hologram_state is None: return False
-        try:
-            maybe = hologram_state.update_link_intensity(link_id, intensity)
-            if inspect.iscoroutine(maybe): await maybe
-            return True
-        except Exception: return False
-    async def _safe_holo_despawn(self, node_id: str, link_id: str) -> bool:
-        if hologram_state is None: return False
-        try:
-            maybe = hologram_state.despawn_and_unlink(node_id, link_id)
-            if inspect.iscoroutine(maybe): await maybe
-            return True
-        except Exception as e:
-            logger.debug(f"Hologram despawn failed: {e}")
-            return False
-
-    # --- [UPGRADED] ---
-    # These animation methods now use the safe helpers and fix the link_id bug.
-    # --- [END UPGRADE] ---
-    async def _holo_animate_write(self, node_id: str, link_id: str):
-        """Background animation: spawn -> active -> pulse -> idle -> despawn"""
-        try:
-            ok = await self._safe_holo_spawn(node_id, "memory", "Memory Write", 4, source_id="Memory", link_id=link_id)
-            if ok:
-                await self._safe_holo_set_active("Memory")
-                await self._safe_holo_update_link(link_id, 0.9) # <-- FIXED
-                await asyncio.sleep(_HOLO_MEDIUM)
-                await self._safe_holo_update_link(link_id, 0.2) # <-- FIXED
-                await self._safe_holo_set_idle("Memory")
-                await self._safe_holo_despawn(node_id, link_id)
-        except Exception as e:
-            logger.debug(f"Holo write animation exception: {e}")
-            
-    async def _holo_animate_read(self, node_id: str, link_id: str):
-        """Background animation for reads."""
-        try:
-            ok = await self._safe_holo_spawn(node_id, "memory", "Memory Read", 4, source_id="Memory", link_id=link_id)
-            if ok:
-                await self._safe_holo_set_active("Memory")
-                await self._safe_holo_update_link(link_id, 0.8) # <-- FIXED
-                await asyncio.sleep(_HOLO_SHORT)
-                await self._safe_holo_update_link(link_id, 0.1) # <-- FIXED
-                await self._safe_holo_set_idle("Memory")
-                await self._safe_holo_despawn(node_id, link_id)
-        except Exception as e:
-            logger.debug(f"Holo read animation exception: {e}")
-
-    # -----------------------
-    # Auditing (remains the same)
-    # -----------------------
-    async def _audit(self, actor: str, action: str, target: str, details: Optional[Dict] = None):
-        """[UPGRADED] Append audit entry (append-only)."""
-        entry = {
-            "ts": _now_ts(),
-            "actor": actor or "system",
-            "action": action,
-            "target": target,
-            "details": details or {}
-        }
-        key = self._audit_key()
-        async with self._locks["audit"]:
-            # --- [CRITICAL FIX] ---
-            # Get the raw object (which might be a dict {"data": []})
-            raw_existing = await self._store_get(key)
-            
-            # Initialize as a list, which _store_put will wrap
-            existing = []
-            if isinstance(raw_existing, list):
-                existing = raw_existing
-            elif isinstance(raw_existing, dict) and "data" in raw_existing:
-                existing = raw_existing["data"]
-            # --- [END FIX] ---
-
-            existing.append(entry)
-            if len(existing) > _MAX_AUDIT_ENTRIES:
-                existing = existing[-_MAX_AUDIT_ENTRIES:]
-            
-            # _store_put will now wrap this list in a dict
-            await self._store_put(key, existing, AUDIT_NAMESPACE)
-
-    # -----------------------
-    # Identity containers (remains the same)
-    # -----------------------
-    async def get_identity_container(self, identity_id: str) -> Dict[str, Any]:
-        """Return identity container (create if missing). Container holds metadata + memory id list."""
-        key = self._identity_container_key(identity_id)
-        async with self._locks["identity"]:
-            _c = await self._store_get(key) or {}
-            container = {
-                "identity_id": identity_id,
-                "created_at": _c.get("created_at", _now_ts()),
-                "name_variants": _c.get("name_variants", []),
-                "behavior_patterns": _c.get("behavior_patterns", {}),
-                "relationships": _c.get("relationships", {}),
-                "permissions": _c.get("permissions", {}),
-                "memory_index": _c.get("memory_index", []),
-                **{k: v for k, v in _c.items() if k not in (
-                    "identity_id","created_at","name_variants","behavior_patterns","relationships","permissions","memory_index"
-                )}
-            }
-            if not _c:
-                await self._store_put(key, container, "identity_container") # Use correct type
-                idx_key = self._root_key("identity_index")
-                idx = await self._store_get(idx_key) or []
-                if identity_id not in idx:
-                    idx.append(identity_id)
-                    await self._store_put(idx_key, idx, "identity_index") # Use correct type
-            return container
-
-    async def update_identity_container(self, identity_id: str, patch: Dict[str, Any]) -> bool:
-        key = self._identity_container_key(identity_id)
-        async with self._locks["identity"]:
-            container = await self.get_identity_container(identity_id)
-            container.update(patch)
-            await self._store_put(key, container, "identity_container") # Use correct type
-        await self._audit("system", "identity_update", identity_id, {"patch": list(patch.keys())})
-        return True
-
-    # -----------------------
-    # Segment index helpers (remains the same)
-    # -----------------------
-    async def _append_to_segment_index(self, segment: str, mem_id: str):
-        key = self._segment_index_key(segment)
-        idx = await self._store_get(key) or []
-        if mem_id not in idx:
-            idx.append(mem_id)
-            if len(idx) > 20000:
-                idx = idx[-20000:]
-            await self._store_put(key, idx, "segment_index") # Use correct type
-
-    async def _remove_from_segment_index(self, segment: str, mem_id: str):
-        key = self._segment_index_key(segment)
-        idx = await self._store_get(key) or []
-        if mem_id in idx:
-            idx.remove(mem_id)
-            await self._store_put(key, idx, "segment_index") # Use correct type
-
-    # -----------------------
-    # Core: store a memory (public API)
-    # -----------------------
-    async def store_memory(
-        self,
-        user_input: str,
-        assistant_response: str,
-        subject_identity_id: str = "owner_primary",
-        importance: int = 1,
-        desired_segment: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        actor: str = "persona"
-    ) -> Tuple[str, str]:
-        """
-        Store a memory and return (memory_id, segment).
-        (This method is now internally hardened against `_store_put` failures)
-        """
-        metadata = metadata or {}
-        node_id = f"mem_write_{uuid.uuid4().hex[:6]}"
-        link_id = f"link_mem_{node_id}"
-        try:
-            asyncio.create_task(self._holo_animate_write(node_id, link_id))
-        except Exception: pass
-
-        # ... (schedule detection logic remains the same) ...
-        scheduled_iso = None
-        schedule_adjusted = False
-        try:
-            if metadata.get("schedule_time_iso"):
-                scheduled_iso = metadata.get("schedule_time_iso")
-            else:
-                text_to_scan = metadata.get("requested_schedule_text") or user_input or assistant_response or ""
-                try:
-                    from dateutil import parser as _dparser
-                    try:
-                        dt = _dparser.parse(text_to_scan, fuzzy=True, default=None)
-                        if dt: scheduled_iso = dt.astimezone().isoformat()
-                    except Exception:
-                        for token in text_to_scan.split(","):
-                            try:
-                                dt = _dparser.parse(token, fuzzy=True, default=None)
-                                if dt: scheduled_iso = dt.astimezone().isoformat(); break
-                            except Exception: continue
-                except Exception:
-                    import re
-                    m = re.search(r'\b((tomorrow|today)\b.*?\b(at )?\d{1,2}(:\d{2})?\s?(am|pm)?)', (text_to_scan or "").lower(), flags=re.IGNORECASE)
-                    if m:
-                        try:
-                            now = time.localtime()
-                            tm = m.group(0)
-                            hr_match = re.search(r'(\d{1,2})(?::(\d{2}))?', tm)
-                            if hr_match:
-                                hr = int(hr_match.group(1)); mn = int(hr_match.group(2) or 0)
-                                is_pm = bool(re.search(r'\bpm\b', tm))
-                                if is_pm and hr < 12: hr += 12
-                                day = 1 if "tomorrow" in tm else 0
-                                ts = time.time() + day * 24 * 3600
-                                date_struct = time.localtime(ts)
-                                scheduled_ts = time.mktime((date_struct.tm_year, date_struct.tm_mon, date_struct.tm_mday, hr, mn, 0, 0, 0, -1))
-                                scheduled_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(scheduled_ts))
-                        except Exception: scheduled_iso = None
-            if scheduled_iso:
-                try:
-                    try:
-                        from dateutil import parser as _dparser
-                        dt = _dparser.parse(scheduled_iso); scheduled_ts = dt.timestamp()
-                    except Exception:
-                        try: scheduled_ts = time.mktime(time.strptime(scheduled_iso.split('.')[0], "%Y-%m-%dT%H:%M:%S"))
-                        except Exception: scheduled_ts = None
-                    now_ts = _now_ts()
-                    if scheduled_ts:
-                        if scheduled_ts + 60 < now_ts:
-                            attempts = 0
-                            while scheduled_ts + 60 < now_ts and attempts < 365:
-                                scheduled_ts += 24 * 3600
-                                attempts += 1
-                            try:
-                                scheduled_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(scheduled_ts))
-                                schedule_adjusted = True
-                            except Exception: schedule_adjusted = False
-                    if scheduled_iso:
-                        metadata["scheduled_for"] = scheduled_iso
-                        metadata["schedule_adjusted"] = schedule_adjusted
-                except Exception: pass
-        except Exception:
-            logger.debug("Schedule parsing/adjustment failed (non-fatal).", exc_info=True)
-
-        content_hash = _content_hash(user_input or "", assistant_response or "")
-        container = await self.get_identity_container(subject_identity_id)
-
-        # duplicate detection
-        for mid in container.get("memory_index", []):
-            mem = await self._store_get(self._memory_key(mid))
-            if mem and mem.get("content_hash") == content_hash:
-                mem["last_touched"] = _now_ts()
-                mem["access_count"] = mem.get("access_count", 0) + 1
-                if metadata.get("scheduled_for"):
-                    mem.setdefault("metadata", {})
-                    mem["metadata"].update(metadata)
-                await self._store_put(self._memory_key(mid), mem, "memory_record") # Use correct type
-                await self._audit(actor, "memory_duplicate_detected", mid, {"subject": subject_identity_id})
-                return mid, mem.get("segment", SEG_CONFIDENTIAL)
-
-        segment = desired_segment or self._decide_segment(user_input or "", assistant_response or "", metadata, subject_identity_id)
-        mem_id = f"mem_{int(_now_ts()*1000)}_{uuid.uuid4().hex[:6]}"
-
-        record = {
-            "id": mem_id, "subject_id": subject_identity_id, "user": user_input or "",
-            "assistant": assistant_response or "", "timestamp": _now_ts(),
-            "importance": int(max(1, min(5, int(importance or 1)))),
-            "content_hash": content_hash, "segment": segment, "metadata": metadata or {},
-            "access_count": 0, "owner_visible": True
-        }
-        if record["metadata"].get("scheduled_for"):
-            try:
-                sf = record["metadata"]["scheduled_for"]
-                try:
-                    from dateutil import parser as _dparser
-                    dt = _dparser.parse(sf)
-                    record["metadata"]["scheduled_for"] = dt.astimezone().isoformat()
-                except Exception: pass
-            except Exception: pass
-
-        await self._store_put(self._memory_key(mem_id), record, "memory_record") # Use correct type
-        container["memory_index"].append(mem_id)
-        if len(container["memory_index"]) > self.max_per_identity:
-            evicted = container["memory_index"].pop(0)
-            try: await self._store_delete(self._memory_key(evicted))
-            except Exception: pass
-        await self._store_put(self._identity_container_key(subject_identity_id), container, "identity_container") # Use correct type
-        await self._append_to_segment_index(segment, mem_id)
-        await self._audit(actor, "memory_store", mem_id, {"segment": segment, "subject": subject_identity_id, "importance": record["importance"], "holo_node": node_id, "schedule_adjusted": schedule_adjusted})
-        return mem_id, segment
-
-    # -----------------------
-    # Convenience aliases for compatibility
-    # -----------------------
-    async def append_memory(self, identity_id: str, memory_record: Dict[str, Any]) -> Tuple[str, str]:
-        mem_id = memory_record.get("id") or f"mem_{int(_now_ts()*1000)}_{uuid.uuid4().hex[:6]}"
-        memory_record["id"] = mem_id
-        subj = memory_record.get("subject_id", "owner_primary")
-        seg = memory_record.get("segment", self._decide_segment(memory_record.get("user",""), memory_record.get("assistant",""), memory_record.get("metadata"), subj))
-        memory_record["segment"] = seg
-        memory_record.setdefault("timestamp", _now_ts())
-        memory_record.setdefault("access_count", 0)
-        await self._store_put(self._memory_key(mem_id), memory_record, "memory_record") # Use correct type
-        container = await self.get_identity_container(subj)
-        container["memory_index"].append(mem_id)
-        if len(container["memory_index"]) > self.max_per_identity:
-            evicted = container["memory_index"].pop(0)
-            try: await self._store_delete(self._memory_key(evicted))
-            except Exception: pass
-        await self._store_put(self._identity_container_key(subj), container, "identity_container") # Use correct type
-        await self._append_to_segment_index(seg, mem_id)
-        await self._audit("system", "append_memory", mem_id, {"subject": subj})
-        return mem_id, seg
-
-    async def write_memory(self, identity_id: str, memory_record: Dict[str, Any]) -> Tuple[str, str]:
-        return await self.append_memory(identity_id, memory_record)
-
-    # -----------------------
-    # Retrieval API (permission-aware)
-    # -----------------------
-    async def retrieve_memories(
-        self,
-        query_text: str,
-        subject_identity_id: str = "owner_primary",
-        requester_id: Optional[str] = None,
-        allowed_segments: Optional[List[str]] = None,
-        limit: int = 5,
-        min_relevance: float = 0.05
-    ) -> List[Dict[str, Any]]:
+        self.logger.info("🛑 Shutting down Memory Manager")
         
-        node_id = f"mem_read_{uuid.uuid4().hex[:6]}"
-        link_id = f"link_mem_{node_id}"
-        try:
-            asyncio.create_task(self._holo_animate_read(node_id, link_id))
-        except Exception: pass
-
-        if requester_id in ("owner_primary", "owner"):
-            permitted = {SEG_CONFIDENTIAL, SEG_ACCESS, SEG_PUBLIC}
-        else:
-            permitted = {SEG_PUBLIC}
-            container = await self.get_identity_container(subject_identity_id)
-            perms = container.get("permissions", {}) or {}
-            if requester_id and requester_id in perms:
-                permitted = set(perms.get(requester_id) or [])
-                permitted.add(SEG_PUBLIC)
-        if allowed_segments:
-            permitted = permitted.intersection(set(allowed_segments))
-
-        container = await self.get_identity_container(subject_identity_id)
-        pool = list(reversed(container.get("memory_index", [])))
-        results = []
-        for mid in pool:
-            mem = await self._store_get(self._memory_key(mid))
-            if not mem: continue
-            if mem.get("segment") not in permitted: continue
-            score = self._relevance_score_simple(query_text or "", mem)
-            if score < min_relevance: continue
-            mem = dict(mem)
-            mem["access_count"] = mem.get("access_count", 0) + 1
-            mem["last_touched"] = _now_ts()
-            try: await self._store_put(self._memory_key(mid), mem, "memory_record") # Use correct type
-            except Exception: pass
-            if requester_id not in ("owner_primary", "owner") and mem.get("segment") == SEG_CONFIDENTIAL:
-                continue
-            results.append((score, mem))
-        results.sort(key=lambda r: (r[0], r[1].get("importance",1), r[1].get("timestamp",0)), reverse=True)
-        selected = [r[1] for r in results[:limit]]
-        await self._audit(requester_id or "anonymous", "memory_read", subject_identity_id, {"query": query_text, "returned": len(selected), "holo_node": node_id})
-        return selected
-
-    # Compatibility method names
-    async def search_memories(self, subject_identity_id: str, query: str = "", limit: int = 5) -> List[Dict[str, Any]]:
-        return await self.retrieve_memories(query_text=query, subject_identity_id=subject_identity_id, limit=limit)
-    async def query_memories(self, subject_identity_id: str, query: str = "", max_results: int = 5) -> List[Dict[str, Any]]:
-        return await self.retrieve_memories(query_text=query, subject_identity_id=subject_identity_id, limit=max_results)
-    async def list_memories_for_subject(self, subject_identity_id: str) -> List[str]:
-        container = await self.get_identity_container(subject_identity_id)
-        return list(container.get("memory_index", []))
-
-    # -----------------------
-    # Simple relevance scoring
-    # -----------------------
-    def _relevance_score_simple(self, query: str, mem: Dict[str,Any]) -> float:
-        qtokens = set(token for token in (query or "").lower().split() if token)
-        mem_text = (mem.get("user","") + " " + mem.get("assistant","")).lower()
-        mtokens = set(token for token in mem_text.split() if token)
-        if not qtokens or not mtokens: base = 0.0
-        else: base = len(qtokens.intersection(mtokens)) / max(1, len(qtokens.union(mtokens)))
-        imp = (mem.get("importance",1)-1) * 0.15
-        age_days = (time.time() - mem.get("timestamp", time.time())) / 86400.0
-        recency = max(0.0, 1.0 - (age_days / 14.0)) * 0.15
-        return min(1.0, base + imp + recency)
-
-    # -----------------------
-    # Permissions management (owner-only API)
-    # -----------------------
-    async def grant_privilege(self, subject_identity_id: str, privileged_user_id: str, segments: List[str]):
-        container = await self.get_identity_container(subject_identity_id)
-        perms = container.get("permissions", {}) or {}
-        perms[privileged_user_id] = list(set(segments))
-        container["permissions"] = perms
-        await self._store_put(self._identity_container_key(subject_identity_id), container, "identity_container") # Use correct type
-        await self._audit("owner", "grant_privilege", subject_identity_id, {"grantee": privileged_user_id, "segments": segments})
-        return True
-
-    async def revoke_privilege(self, subject_identity_id: str, privileged_user_id: str):
-        container = await self.get_identity_container(subject_identity_id)
-        perms = container.get("permissions", {}) or {}
-        if privileged_user_id in perms:
-            perms.pop(privileged_user_id)
-            container["permissions"] = perms
-            await self._store_put(self._identity_container_key(subject_identity_id), container, "identity_container") # Use correct type
-            await self._audit("owner", "revoke_privilege", subject_identity_id, {"revoked": privileged_user_id})
-        return True
-
-    # -----------------------
-    # Utilities
-    # -----------------------
-    async def list_identities(self) -> List[str]:
-        key = self._root_key("identity_index")
-        idx = await self._store_get(key)
-        if isinstance(idx, list):
-            return idx
-        return []
-
-    async def export_memory_snapshot(self, subject_identity_id: str) -> Dict[str,Any]:
-        container = await self.get_identity_container(subject_identity_id)
-        mems = []
-        for mid in container.get("memory_index", []):
-            m = await self._store_get(self._memory_key(mid))
-            if m:
-                mems.append(m)
-        return {"identity": container, "memories": mems}
-
-    # -----------------------
-    # Persistence helpers & root index
-    # -----------------------
-    async def get_root_index(self) -> Dict[str, Any]:
-        """Return a small root index suitable for quick syncing/inspection."""
-        idx_key = self._root_key("root_index")
-        root = await self._store_get(idx_key) or {}
-        if not root:
-            identities = await self.list_identities()
-            root = {"identities": identities, "count": len(identities), "timestamp": _now_ts()}
-            await self._store_put(idx_key, root, "root_index") # Use correct type
-        return root
-
-    async def load_index(self) -> Dict[str, Any]:
-        """Compatibility: load_index alias for get_root_index"""
-        return await self.get_root_index()
-
-    async def save_index(self, index_data: Dict[str, Any]) -> bool:
-        """Persist a provided index object (best-effort)."""
-        idx_key = self._root_key("root_index")
-        try:
-            await self._store_put(idx_key, index_data, "root_index") # Use correct type
-            return True
-        except Exception as e:
-            logger.warning(f"save_index failed: {e}")
-            return False
-
-    # -----------------------
-    # Put/get by memory key (compat wrappers)
-    # -----------------------
-    async def put(self, key: str, category: Optional[str] = None, obj: Optional[Any] = None):
-        if obj is None and category is not None:
-            if isinstance(category, dict):
-                # Assumes (key, obj) was passed
-                return await self._store_put(self._memory_key(key), category, "memory_record")
-            return False
-        if obj is not None:
-            if isinstance(obj, dict) and obj.get("id"):
-                return await self._store_put(self._memory_key(obj["id"]), obj, category or "memory_record")
-            return await self._store_put(self._memory_key(key), obj, category or "memory_record")
-        return False
-
-    async def get(self, key: str, category: Optional[str] = None):
-        if key and key.startswith("mem_"):
-            return await self._store_get(self._memory_key(key))
-        return await self._store_get(self._root_key(key))
-
-    # -----------------------
-    # Important persistence
-    # -----------------------
-    async def persist_important(self, subject_identity_id: str, memory_record: Dict[str, Any]) -> bool:
-        try:
-            if memory_record.get("id") is None:
-                memory_record["id"] = f"mem_{int(_now_ts()*1000)}_{uuid.uuid4().hex[:6]}"
-            await self._store_put(self._memory_key(memory_record["id"]), memory_record, "critical_memory") # Use correct type
-            container = await self.get_identity_container(subject_identity_id)
-            if memory_record["id"] not in container["memory_index"]:
-                container["memory_index"].append(memory_record["id"])
-                await self._store_put(self._identity_container_key(subject_identity_id), container, "identity_container") # Use correct type
-            await self._audit("system", "persist_important", memory_record["id"], {"subject": subject_identity_id})
-            return True
-        except Exception as e:
-            logger.warning(f"persist_important failed: {e}")
-            return False
-
-    # -----------------------
-    # Pruning / maintenance
-    # -----------------------
-    async def prune_old_memories(self, max_age_days: int = 30, min_importance: int = 4) -> Dict[str, int]:
-        """
-        Prune memories older than max_age_days unless importance >= min_importance.
-        Returns counts of removed items per identity.
-        """
-        cutoff = _now_ts() - (max_age_days * 24 * 3600)
-        removed_per_identity = {}
-        identities = await self.list_identities()
-        for ident in identities:
-            container = await self.get_identity_container(ident)
-            kept = []
-            removed = 0
-            for mid in container.get("memory_index", []):
-                mem = await self._store_get(self._memory_key(mid))
-                if not mem:
-                    removed += 1
-                    continue
-                timestamp = mem.get("timestamp", 0)
-                importance = mem.get("importance", 1)
-                if timestamp < cutoff and importance < min_importance:
-                    try:
-                        await self._store_delete(self._memory_key(mid))
-                    except Exception: pass
-                    removed += 1
-                else:
-                    kept.append(mid)
-            if removed > 0:
-                container["memory_index"] = kept
-                await self._store_put(self._identity_container_key(ident), container, "identity_container") # Use correct type
-                removed_per_identity[ident] = removed
-                await self._audit("system", "prune_old_memories", ident, {"removed": removed})
-        return removed_per_identity
-
-    # -----------------------
-    # Simple search helper: naive scan across segments (not vector search)
-    # -----------------------
-    async def search_memories_text(self, query_text: str, segment_filter: Optional[List[str]] = None, limit: int = 20) -> List[Dict[str, Any]]:
-        """
-        Scan segment indices and return matching memories (naive textual match).
-        Useful for admin/inspection.
-        """
-        found = []
-        segments = [SEG_CONFIDENTIAL, SEG_ACCESS, SEG_PUBLIC] if segment_filter is None else segment_filter
-        for seg in segments:
-            idx = await self._store_get(self._segment_index_key(seg)) or []
-            for mid in idx:
-                mem = await self._store_get(self._memory_key(mid))
-                if not mem: continue
-                text = (mem.get("user","") + " " + mem.get("assistant","")).lower()
-                if not query_text or all(tok in text for tok in (query_text or "").lower().split()):
-                    found.append(mem)
-                    if len(found) >= limit:
-                        return found
-        return found
-    
-    async def append_transcript(self, identity_id: str, transcript_entry: Dict[str, Any]) -> str:
-        """
-        Appends a raw transcript entry to the identity's transcript store.
-        """
-        key = self._transcript_index_key(identity_id)
-        entry_id = transcript_entry.get("id", f"tx_{uuid.uuid4().hex[:8]}")
-        transcript_entry["id"] = entry_id
+        # Persist all memories
+        if self.initialized:
+            await self.persist_all_system_memories()
         
-        async with self._locks["store"]:
-            transcripts = await self._store_get(key) or []
-            transcripts.append(transcript_entry)
-            if len(transcripts) > self.max_per_identity:
-                transcripts = transcripts[-self.max_per_identity:]
-            await self._store_put(key, transcripts, "transcript_index") # Use correct type
-            
-        await self._audit("persona", "transcript_append", entry_id, {"subject": identity_id})
-        return entry_id
-
-    # --- [UPGRADED] ---
-    # Renamed from 'append_semantic_entry' to 'append_semantic'
-    # to match the interface PersonaCore is calling.
-    # --- [END UPGRADE] ---
-    async def append_semantic(self, identity_id: str, semantic_entry: Dict[str, Any]) -> str:
-        """
-        Appends a compact semantic entry to the identity's semantic index.
-        """
-        key = self._semantic_index_key(identity_id)
-        entry_id = semantic_entry.get("id", f"sem_{uuid.uuid4().hex[:8]}")
-        semantic_entry["id"] = entry_id
+        # Clear memory layers
+        self.user_memory_layers.clear()
+        self.initialized = False
         
-        async with self._locks["store"]:
-            index = await self._store_get(key) or []
-            index.append(semantic_entry)
-            if len(index) > self.max_per_identity:
-                index = index[-self.max_per_identity:]
-            await self._store_put(key, index, "semantic_index") # Use correct type
-            
-        await self._audit("persona", "semantic_append", entry_id, {"subject": identity_id})
-        return entry_id
+        self.logger.info("✅ Memory Manager shutdown complete")
 
-    # --- [NEW] ---
-    # These methods are required by the upgraded PersonaCore and main.py
-    # for persistence and health checks.
-    # --- [END NEW] ---
-    
-    async def save_transcript_store(self, identity_id: str, transcripts: List[Dict[str, Any]]) -> bool:
-        """
-        [NEW] Overwrites the entire transcript store for a given identity.
-        Used by maintenance loops.
-        """
-        key = self._transcript_index_key(identity_id)
-        try:
-            await self._store_put(key, transcripts, "transcript_index")
-            return True
-        except Exception as e:
-            logger.warning(f"save_transcript_store failed for {identity_id}: {e}")
-            return False
+# Global memory manager instance
+memory_manager = MemoryManager()
 
-    async def save_semantic_index(self, identity_id: str, semantic_index: List[Dict[str, Any]]) -> bool:
-        """
-        [NEW] Overwrites the entire semantic index for a given identity.
-        Used by maintenance loops.
-        """
-        key = self._semantic_index_key(identity_id)
-        try:
-            await self._store_put(key, semantic_index, "semantic_index")
-            return True
-        except Exception as e:
-            logger.warning(f"save_semantic_index failed for {identity_id}: {e}")
-            return False
+# Convenience functions for easy access
+async def initialize_memory_manager(assistant_core=None):
+    """Initialize the global memory manager"""
+    global memory_manager
+    # Reinitialize with assistant core if provided
+    if assistant_core:
+        memory_manager = MemoryManager(assistant_core=assistant_core)
+    return await memory_manager.initialize()
 
-    async def health_check(self) -> Dict[str, Any]:
-        """
-        [NEW] Performs a simple health check on the memory manager.
-        Tries to read the root index.
-        """
-        try:
-            index = await self.get_root_index()
-            if index is not None and isinstance(index.get("identities"), list):
-                return {"status": "healthy", "identities": index.get("count", 0)}
-            else:
-                return {"status": "degraded", "error": "Root index is malformed."}
-        except Exception as e:
-            return {"status": "unhealthy", "error": str(e)}
+async def store_memory(user_id: str, content: str, memory_type: Union[MemoryType, str], **kwargs):
+    """Convenience function to store memory"""
+    if isinstance(memory_type, str):
+        memory_type = MemoryType(memory_type)
+    return await memory_manager.store_user_memory(user_id, content, memory_type, **kwargs)
 
-    # -----------------------
-    # Back-compat convenience wrappers
-    # -----------------------
-    get_root_index = get_root_index
-    load_index = load_index
-    save_index = save_index
-    append_memory = append_memory
-    write_memory = write_memory
-    search_memories = search_memories
-    query_memories = query_memories
-    list_memories_for_subject = list_memories_for_subject
-    persist_important = persist_important
-    prune_old_memories = prune_old_memories
-    put = put
-    get = get
-    delete = _store_delete
-    
-    # --- [NEW] ---
-    # Add aliases for the new methods
-    append_semantic_entry = append_semantic # Alias for old callers
-    # --- [END NEW] ---
-
-# End of file
+async def retrieve_memories(user_id: str, query: Optional[str] = None, **kwargs):
+    """Convenience function to retrieve memories"""
+    return await memory_manager.retrieve_user_memories(user_id, query, **kwargs)
