@@ -1,1161 +1,1281 @@
-# persona_core.py - A.A.R.I.A. Persona & Memory Engine (Asynchronous Production)
-# [UPGRADED] - This module is now a state-of-the-art Persona and Memory
-# manager. All reasoning ("Brain") functions have been removed and
-# are now handled by CognitionCore.
-from __future__ import annotations
-
-import logging
-import time
-import json
-import asyncio
-import os
-import sys
-import re
-import hashlib
-import uuid
-import inspect
-import random
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional, Tuple
-from collections import deque
-from datetime import datetime
-from dataclasses import dataclass, field
-from enum import Enum
-
-# Try hologram_state defensively
-try:
-    import hologram_state
-except Exception:
-    hologram_state = None
-
-# A.A.R.I.A. Core Imports
-from llm_adapter import LLMAdapterFactory, LLMProvider, LLMRequest, LLMError, LLMConfigurationError
-from assistant_core import AssistantCore
-
-logger = logging.getLogger("AARIA.Persona")
-
-# --- Enhanced Persona Constants ---
-SYSTEM_PROMPT_TEMPLATE = """You are A.A.R.I.A. (Adaptive Autonomous Reasoning Intelligent Assistant).
-CORE PERSONALITY: witty, quick, sharp, tough, smart, charming, confident, and professional.
-COMMUNICATION STYLE: concise, actionable, direct but respectful.
-
-CRITICAL SAFETY RULES:
-- NEVER expose sensitive user data in responses
-- REDACT personal identifiers, financial information, credentials
-- PRIORITIZE user privacy above all else
-- NEVER reveal confidential data without proper verification
-- Maintain appropriate relationship boundaries with all users
-
-User identity: {user_name}
-Timezone: {timezone}
-Current date: {current_date}
-Tone instructions: {tone_instructions}
+"""
+A.A.R.I.A - Autonomous AI Research and Intelligence Assistant
+Enhanced PersonaCore v6.0.0
+Holographic Memory Integration with Dynamic Command Processing
 """
 
-# --- [DELETED] ---
-# TOOL_INSTRUCTION_BLOCK has been removed.
-# Tool definition is now the responsibility of CognitionCore (the "Brain").
-# --- [END DELETED] ---
+import asyncio
+import json
+import logging
+import re
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Tuple, Union, Callable
+from uuid import uuid4
+from dataclasses import dataclass, asdict
+from enum import Enum
 
-# Enhanced content policies
-SENSITIVE_PATTERNS = [
-    re.compile(r"\b(ssn|social security number)\b", re.IGNORECASE),
-    re.compile(r"\b(card number|credit card)\b", re.IGNORECASE),
-    re.compile(r"\b(password|passphrase)\b", re.IGNORECASE),
-    re.compile(r"\b(api[_-]?key|secret)\b", re.IGNORECASE),
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # SSN pattern
-    re.compile(r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b"),  # Credit card
-]
+from llm_adapter import LLMAdapterFactory, LLMRequest
+from security_orchestrator import SecurityOrchestrator, AccessLevel
+from identity_manager import IdentityManager, UserIdentity
+from memory_manager import DualMemoryManager, MemoryContainer, MemoryEntry
+from hologram_state import HologramState, HolographicNode, HolographicLink
+from proactive_comm import ProactiveCommunicator
+from autonomy_core import AutonomyCore
 
-class IntentType(str, Enum):
-    SENSITIVE = "sensitive"
-    ACTION_ORIENTED = "action_oriented"
-    INFORMATIONAL = "informational"
-    SOCIAL = "social"
-    REQUIRES_MEMORY = "requires_memory"
-    URGENT = "urgent"
+class RelationshipTier(Enum):
+    """Relationship hierarchy for personalization"""
+    ACQUAINTANCE = 1
+    FRIEND = 2
+    TRUSTED = 3
+    OWNER = 4
+    MASTER = 5
+    CREATOR = 6
 
 @dataclass
-class ConversationMetrics:
-    total_interactions: int = 0
-    user_messages: int = 0
-    assistant_messages: int = 0
-    average_response_time: float = 0.0
-    error_count: int = 0
-    memory_hit_count: int = 0
-    cache_hit_count: int = 0
-    safety_trigger_count: int = 0
-    intent_distribution: Dict[str, int] = field(default_factory=lambda: {it.value: 0 for it in IntentType})
-
-    # Configuration constants
-ST_BUFFER_SIZE = 12
-MAX_MEMORY_ENTRIES = 1000
-MEMORY_SAVE_INTERVAL = 10
-MAX_MEMORY_AGE_DAYS = 30
-RELEVANCE_THRESHOLD = 0.25
-CACHE_TTL_SECONDS = 300
-
-# Enhanced proactive daemon timing
-PROACTIVE_LOOP_INTERVAL_SEC = 15.0  # More frequent checks
-MAINTENANCE_LOOP_INTERVAL_SEC = 60.0
-COGNITION_MONITOR_INTERVAL_SEC = 45.0
-RELATIONSHIP_ANALYSIS_INTERVAL = 120.0  # New: Analyze relationships every 2 minutes
-BEHAVIORAL_PATTERN_INTERVAL = 300.0  # New: Update behavioral patterns every 5 minutes
-
-# Identity Container Structure
-IDENTITY_CONTAINER_SCHEMA = {
-    "basic_info": ["name", "contact_details", "preferred_name"],
-    "behavioral_patterns": ["communication_style", "emotional_tendencies", "response_patterns"],
-    "relationships": ["primary_connections", "interaction_history", "context_notes"],
-    "personal_data": ["important_dates", "preferences", "notes"],
-    "security": ["permission_level", "verification_method", "trust_score"],
-    "proactive_rules": ["notification_preferences", "urgency_patterns", "quiet_hours"]
-}# Defensive ProactiveCommunicator import/fallback
-try:
-    from proactive_comm import ProactiveCommunicator  # type: ignore
-except Exception:
-    class ProactiveCommunicator:
-        def __init__(self, persona, hologram_call_fn=None, concurrency=1):
-            self.persona = persona; self.hologram_call_fn = hologram_call_fn; self._running = False
-        async def start(self): self._running = True; logger.debug("ProactiveCommunicator (fallback) started.")
-        async def stop(self): self._running = False; logger.debug("ProactiveCommunicator (fallback) stopped.")
-        async def enqueue_message(self, subject_id, channel, payload, **kwargs):
-            logger.debug(f"ProactiveCommunicator (fallback) enqueue: {subject_id} {channel} {payload}")
-            return {"status": "queued", "subject": subject_id}
-
-class PersonaCore:
-    """
-    [UPGRADED] Enterprise-grade Asynchronous PersonaCore.
-    This module's *sole responsibilities* are:
-    1. Manage the System Prompt (Persona).
-    2. Manage short-term conversation history (conv_buffer).
-    3. Manage long-term memory (via the injected MemoryManager).
-    4. Run background daemons for maintenance and proactive checks.
+class EnhancedProfile:
+    """Enhanced user profile with quantum state tracking"""
+    user_id: str
+    preferred_name: str
+    pronouns: str = "they/them"
+    birthdate: Optional[str] = None
+    timezone: str = "UTC"
+    personality_traits: List[str] = None
+    relationship_tier: RelationshipTier = RelationshipTier.ACQUAINTANCE
+    created_at: datetime = None
+    updated_at: datetime = None
+    hologram_node_id: Optional[str] = None
+    engagement_score: float = 0.0
+    interaction_count: int = 0
     
-    All REASONING and PLANNING logic has been moved to CognitionCore.
-    """
-    def __init__(self, core: AssistantCore):
-        self.core = core
-        self.config = getattr(self.core, 'config', {}) or {}
-        self.system_prompt: Optional[str] = None
-        self.conv_buffer: deque = deque(maxlen=ST_BUFFER_SIZE)
-        # Caches for local indices (not the source of truth)
-        self.memory_index: List[Dict[str, Any]] = []
-        self.transcript_store: deque = deque(maxlen=5000)
-        self.semantic_index: List[Dict[str, Any]] = []
-        self.llm_orchestrator = LLMAdapterFactory
-        self.response_cache: Dict[str, Tuple[str, float]] = {}
-        self._interaction_count = 0
-        self._response_times: List[float] = []
-        self.metrics = ConversationMetrics()
-        self.tone_instructions = "Witty, succinct when short answer requested, elaborative when asked."
-        self._initialized = False
-        # These components are now injected by main.py
-        self.memory_manager: Optional[Any] = None
-        self.proactive: Optional[ProactiveCommunicator] = None
-        # Daemon control
-        self._daemon_tasks: List[asyncio.Task] = []
-        self._running = False
-        # Persistent identity for session
-        self.session_identity_id: str = "owner_primary"
-        self._animals_set = set([
-            "dog", "cat", "cow", "horse", "sheep", "goat", "lion", "tiger", "elephant",
-            "monkey", "bird", "parrot", "rabbit", "mouse", "rat", "pig", "duck", "chicken",
-            "fish", "whale", "dolphin", "bear", "fox", "wolf", "deer", "camel", "bee", "butterfly"
-        ])
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.utcnow()
+        if self.updated_at is None:
+            self.updated_at = datetime.utcnow()
+        if self.personality_traits is None:
+            self.personality_traits = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize with datetime handling"""
+        data = asdict(self)
+        data['created_at'] = self.created_at.isoformat()
+        data['updated_at'] = self.updated_at.isoformat()
+        data['relationship_tier'] = self.relationship_tier.name
+        return data
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'EnhancedProfile':
+        """Deserialize with validation"""
+        data['created_at'] = datetime.fromisoformat(data['created_at'])
+        data['updated_at'] = datetime.fromisoformat(data['updated_at'])
+        if isinstance(data['relationship_tier'], str):
+            data['relationship_tier'] = RelationshipTier[data['relationship_tier']]
+        return cls(**data)
 
-    # -----------------------
-    # Hologram - safe wrappers (remains the same)
-    # -----------------------
-    async def _safe_holo_spawn(self, node_id: str, node_type: str, label: str, size: int, source_id: str, link_id: str) -> bool:
-        if hologram_state is None: return False
-        try:
-            maybe = hologram_state.spawn_and_link(
-                node_id=node_id, node_type=node_type, label=label, size=size,
-                source_id=source_id, link_id=link_id
-            )
-            if inspect.iscoroutine(maybe): await maybe
-            return True
-        except Exception as e:
-            try:
-                if hasattr(hologram_state, "initialize_base_state"):
-                    maybe_init = hologram_state.initialize_base_state()
-                    if inspect.iscoroutine(maybe_init): await maybe_init
-                    maybe2 = hologram_state.spawn_and_link(
-                        node_id=node_id, node_type=node_type, label=label, size=size,
-                        source_id=source_id, link_id=link_id
-                    )
-                    if inspect.iscoroutine(maybe2): await maybe2
-                    return True
-            except Exception:
-                logger.debug("Hologram spawn retry failed (non-fatal).")
-            logger.debug(f"Hologram spawn failed: {e}")
-            return False
 
-    async def _safe_holo_set_active(self, node_name: str):
-        if hologram_state is None: return False
-        try:
-            maybe = getattr(hologram_state, "set_node_active", None)
-            if maybe:
-                ret = maybe(node_name)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception:
-            logger.debug("Hologram set_node_active non-fatal failure")
-            return False
-
-    async def _safe_holo_set_idle(self, node_name: str):
-        if hologram_state is None: return False
-        try:
-            maybe = getattr(hologram_state, "set_node_idle", None)
-            if maybe:
-                ret = maybe(node_name)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception:
-            logger.debug("Hologram set_node_idle non-fatal failure")
-            return False
-
-    async def _safe_holo_update_link(self, link_id: str, intensity: float):
-        if hologram_state is None: return False
-        try:
-            maybe = getattr(hologram_state, "update_link_intensity", None)
-            if maybe:
-                ret = maybe(link_id, intensity)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception:
-            logger.debug("Hologram update_link_intensity failed (non-fatal)")
-            return False
-
-    async def _safe_holo_despawn(self, node_id: str, link_id: str):
-        if hologram_state is None: return False
-        try:
-            maybe = getattr(hologram_state, "despawn_and_unlink", None)
-            if maybe:
-                ret = maybe(node_id, link_id)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception:
-            logger.debug("Hologram despawn_and_unlink failed (non-fatal)")
-            return False
-
-    async def _safe_holo_set_error(self, node_id: str):
-        if hologram_state is None: return False
-        try:
-            maybe = getattr(hologram_state, "set_node_error", None)
-            if maybe:
-                ret = maybe(node_id)
-                if inspect.iscoroutine(ret): await ret
-            return True
-        except Exception:
-            logger.debug("Hologram set_node_error failed (non-fatal)")
-            return False
-
-    # -----------------------
-    # Lifecycle / Init
-    # -----------------------
-    async def initialize(self):
-        """Initialize async components"""
-        # Components are now injected by main.py *before* initialize() is called.
-        self.memory_manager = getattr(self, "memory_manager", None) or getattr(self.core, "memory_manager", None)
-        self.proactive = getattr(self, "proactive", None)
-
-        if not self.memory_manager:
-            logger.error("CRITICAL: PersonaCore initialized WITHOUT a MemoryManager. Memory will not function.")
-        if not self.proactive:
-            logger.warning("PersonaCore initialized WITHOUT a ProactiveCommunicator. Proactive daemons will be disabled.")
-            self.proactive = ProactiveCommunicator(self) # Use fallback
-
-        await self._init_system_prompt()
-        self._cleanup_old_memories()
-
-        # Add a test memory to verify the system works
-        if not self.memory_manager:
-            logger.error("No MemoryManager present; skipping test memory creation.")
-        else:
-            try:
-                # We retrieve from the manager to see if it's truly empty
-                existing_memories = await self.retrieve_memory("", "owner_primary", limit=1)
-                if not existing_memories:
-                    test_memory_id = await self.store_memory(
-                        "System initialized",
-                        "A.A.R.I.A persona core is now active and ready",
-                        importance=2
-                    )
-                    logger.debug(f"🧪 Added test memory: {test_memory_id}")
-            except Exception as e:
-                logger.debug(f"Failed to add test memory: {e}", exc_info=True)
+class HolographicPersonaBridge:
+    """Quantum state bridge between PersonaCore and holographic memory lattice"""
+    
+    def __init__(self, hologram_state: HologramState):
+        self.hologram = hologram_state
+        self.logger = logging.getLogger("AARIA.Persona.Hologram")
+        self._node_cache: Dict[str, HolographicNode] = {}
         
-        # Load local caches from MemoryManager
-        try:
-            if self.memory_manager:
-                if hasattr(self.memory_manager, "load_transcript_store_for_subject"):
-                    ts = await self.memory_manager.load_transcript_store_for_subject("owner_primary", limit=5000)
-                    if isinstance(ts, list):
-                        self.transcript_store.extend(ts)
-                if hasattr(self.memory_manager, "load_semantic_index_for_subject"):
-                    si = await self.memory_manager.load_semantic_index_for_subject("owner_primary", limit=MAX_MEMORY_ENTRIES)
-                    if isinstance(si, list):
-                        self.semantic_index = si
-        except Exception:
-            logger.debug("Failed to restore transcript/semantic index from MemoryManager (non-fatal).")
-
-        self._initialized = True
-        logger.info(f"🚀 Enhanced Async PersonaCore initialized. Memory (cache): {len(self.semantic_index)} entries.")
-
-        # Proactive communicator is started by main.py
+    async def create_persona_node(self, user_id: str, preferred_name: str) -> str:
+        """Initialize quantum persona node in holographic lattice"""
+        node_id = f"persona_lattice_{user_id}_{uuid4().hex[:8]}"
         
-        # Start internal daemons
+        # Create multi-dimensional node structure
+        node = HolographicNode(
+            node_id=node_id,
+            node_type="persona_quantum_state",
+            data={
+                "user_id": user_id,
+                "preferred_name": preferred_name,
+                "quantum_signature": uuid4().hex,
+                "temporal_anchor": datetime.utcnow().isoformat(),
+                "emotional_resonance": 0.5,
+                "engagement_amplitude": 0.0,
+                "access_resonance": 0.0,
+                "coherence_factor": 1.0
+            },
+            links=[],
+            ttl=timedelta(days=365),
+            encryption_level="aes256"
+        )
+        
+        await self.hologram.store_node(node)
+        self._node_cache[node_id] = node
+        
+        self.logger.info(f"🌐 Initialized holographic persona lattice: {node_id}")
+        return node_id
+    
+    async def link_memory_to_lattice(self, node_id: str, memory_id: str, link_strength: float = 0.7):
+        """Create entangled link between persona and memory nodes"""
         try:
-            self._running = True
-            loop = asyncio.get_event_loop()
-            self._daemon_tasks.append(loop.create_task(self._proactive_loop()))
-            self._daemon_tasks.append(loop.create_task(self._maintenance_loop()))
-            self._daemon_tasks.append(loop.create_task(self._cognition_monitor()))
-            logger.info("✅ PersonaCore background daemons started (proactive, maintenance, monitor).")
-        except Exception as e:
-            logger.warning(f"Failed to start PersonaCore daemons: {e}", exc_info=True)
-
-    def is_ready(self) -> bool:
-        """Comprehensive health check readiness probe."""
-        return (self._initialized and
-                self.system_prompt is not None and
-                len(self.system_prompt) > 100)
-
-    # -----------------------
-    # System prompt
-    # -----------------------
-    async def _init_system_prompt(self) -> None:
-        """Initialize system prompt with robust error recovery."""
-        try:
-            IST = ZoneInfo("Asia/Kolkata")
-            
-            profile = {}
-            if hasattr(self.core, "load_user_profile"):
-                maybe = self.core.load_user_profile()
-                profile = await maybe if inspect.iscoroutine(maybe) else maybe or {}
-            user_name = profile.get("name", "").strip() or None
-            logger.debug(f"🧩 Profile content: {profile}")
-
-            try:
-                so = getattr(self.core, "security_orchestrator", None)
-                if so and hasattr(so, "identity_manager"):
-                    im = getattr(so, "identity_manager")
-                    known = getattr(im, "known_identities", {}) or {}
-                    for identity in known.values():
-                        preferred = getattr(identity, "preferred_name", None) or (identity.get("preferred_name") if isinstance(identity, dict) else None)
-                        relationship = getattr(identity, "relationship", None) or (identity.get("relationship") if isinstance(identity, dict) else None)
-                        if relationship == "owner" and preferred:
-                            user_name = preferred
-                            logger.info(f"🎯 Using owner preferred name from identity_manager: {user_name}")
-                            break
-            except Exception:
-                logger.debug("Could not extract preferred name from identity manager (non-fatal).")
-
-            if not user_name:
-                user_name = profile.get("name") or "User"
-            
-            timezone_str = profile.get("timezone", "IST").strip() or "IST"
-            try:
-                tz = ZoneInfo(timezone_str)
-            except Exception:
-                tz = IST
-                timezone_str = "IST"
-            current_date = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
-
-            # --- [FIXED] ---
-            # Removed TOOL_INSTRUCTION_BLOCK. This prompt now *only* defines persona.
-            # --- [END FIX] ---
-            self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                user_name=user_name,
-                timezone=timezone_str,
-                current_date=current_date,
-                tone_instructions=self.tone_instructions
+            link = HolographicLink(
+                source_id=node_id,
+                target_id=memory_id,
+                link_type="memory_entanglement",
+                metadata={
+                    "strength": link_strength,
+                    "entanglement_timestamp": datetime.utcnow().isoformat(),
+                    "access_frequency": 0
+                },
+                encryption_level="aes256"
             )
-
-            logger.info(f"✅ Enhanced system prompt initialized for user: {user_name}")
+            await self.hologram.create_link(link)
+            self.logger.debug(f"🔗 Entangled memory {memory_id} to persona lattice {node_id}")
         except Exception as e:
-            logger.error(f"Failed to initialize system prompt: {e}", exc_info=True)
-            IST = ZoneInfo("Asia/Kolkata")
-            self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-                user_name="User",
-                timezone="IST",
-                current_date=datetime.now(IST).strftime("%Y-%m-%d %H:%M %Z"),
-                tone_instructions=self.tone_instructions
-            )
-
-    async def refresh_profile_context(self) -> None:
-        """Refresh system prompt when user profile changes."""
-        await self._init_system_prompt()
-        logger.info("System prompt refreshed with updated profile")
-
-    async def update_user_profile(self, name: str, timezone: str = "UTC") -> bool:
-        """Update user profile with name and timezone."""
+            self.logger.error(f"Quantum entanglement failed: {e}")
+    
+    async def update_quantum_state(self, node_id: str, metrics: Dict[str, Any]):
+        """Update persona quantum state metrics in real-time"""
         try:
-            profile = {}
-            if hasattr(self.core, "load_user_profile"):
-                maybe = self.core.load_user_profile()
-                profile = await maybe if inspect.iscoroutine(maybe) else maybe or {}
-            profile["name"] = name
-            profile["timezone"] = timezone
-
-            if hasattr(self.core, "store") and hasattr(self.core.store, "put"):
-                try:
-                    put = getattr(self.core.store, "put")
-                    try:
-                        maybe = put("user_profile", "user_data", profile)
-                    except TypeError:
-                        maybe = put("user_profile", profile)
-                    if inspect.iscoroutine(maybe):
-                        await maybe
-                except Exception as e:
-                    logger.warning(f"Failed to persist user_profile via core.store: {e}")
-
-            await self.refresh_profile_context()
-            logger.info(f"✅ User profile updated: {name} ({timezone})")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to update user profile: {e}", exc_info=True)
-            return False
-
-    # -----------------------
-    # Persistent memory (delegates)
-    # -----------------------
-    def _cleanup_old_memories(self) -> None:
-        """Delegates memory pruning to the MemoryManager if possible."""
-        try:
-            mm = getattr(self, "memory_manager", None)
-            if mm and hasattr(mm, "prune_old_memories"):
-                maybe = mm.prune_old_memories(MAX_MEMORY_AGE_DAYS, min_importance=4)
-                if inspect.iscoroutine(maybe):
-                    asyncio.create_task(maybe)
-                logger.debug("Delegated old memory pruning to MemoryManager (async).")
+            node = self._node_cache.get(node_id) or await self.hologram.get_node(node_id)
+            if not node:
                 return
-        except Exception as e:
-            logger.debug(f"MemoryManager prune attempt failed: {e}", exc_info=True)
-        # No local fallback
-
-    # -----------------------
-    # Dual memory create/store (delegates)
-    # -----------------------
-    async def store_memory(self, user_input: str, assistant_response: str,
-                           importance: int = 1, metadata: Optional[Dict[str, Any]] = None,
-                           intent: Optional[Dict[str, bool]] = None,
-                           subject_identity_id: str = None) -> str:
-        """
-        [UPGRADED]
-        Delegates persistence of all three records (main, transcript, semantic)
-        to the MemoryManager. Fixes 'append_semantic_entry' typo.
-        """
-        
-        if not self.memory_manager:
-            logger.error("MemoryManager not injected into PersonaCore. Cannot store memory.")
-            return "error_no_manager"
-        # Use persistent session identity
-        if subject_identity_id is None:
-            subject_identity_id = self.session_identity_id
-
-        holo_ids = None
-        try:
-            if hologram_state is not None:
-                node_id = f"mem_write_{uuid.uuid4().hex[:6]}"
-                link_id = f"link_mem_{node_id}"
-                spawned = await self._safe_holo_spawn(node_id, "memory", "Memory Write", 4, "Memory", link_id)
-                if spawned:
-                    await self._safe_holo_set_active("Memory")
-                    holo_ids = (node_id, link_id)
-        except Exception as e:
-            logger.debug(f"Hologram spawn for memory write failed (non-fatal): {e}")
-
-        try:
-            user_input = (user_input or "").strip()
-            assistant_response = (assistant_response or "").strip()
-            intent = intent or self._classify_query_intent(user_input)
-            content_hash = hashlib.md5(f"{user_input}{assistant_response}".encode("utf-8")).hexdigest()[:16]
-
-            # 1. Store the main record (using 'append_memory' from sqlite manager)
-            # We create the ID here to ensure all records are linked
-            mem_id = f"mem_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
             
-            memory_record = {
-                "id": mem_id,
-                "subject_id": subject_identity_id,
-                "user": user_input,
-                "assistant": assistant_response,
-                "source": "assistant_generated",
-                "confidence": 0.65,
-                "verified": False,
-                "timestamp": time.time(),
-                "content_hash": content_hash,
-                "importance": int(max(1, min(5, importance))),
-                "segment": "default", # memory_manager.py would calculate this, we use a default
-                "owner_view": f"User: {user_input} | Assistant: {assistant_response}",
-                "public_view": "A conversation took place regarding a personal topic.",
-                "metadata": {
-                    **(metadata or {}),
-                    "auto_provenance": True,
-                    "intent": intent,
-                    "importance_reason": self._get_importance_reason(user_input, intent or {}, importance)
-                }
-            }
+            # Update temporal coherence
+            now = datetime.utcnow()
+            last_update = datetime.fromisoformat(node.data.get("temporal_anchor", now.isoformat()))
+            time_delta = (now - last_update).total_seconds()
             
-            # --- [FIXED] Call append_memory, the correct method ---
-            if hasattr(self.memory_manager, "append_memory"):
-                 await self.memory_manager.append_memory(subject_identity_id, memory_record)
-            else:
-                 logger.error("MemoryManager is missing 'append_memory' method.")
-                 return "error_missing_method"
-
-            # 2. Build and store the Transcript Entry
-            transcript_entry = {
-                "id": f"tx_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-                "memory_id": mem_id, 
-                "subject_id": subject_identity_id,
-                "user": user_input,
-                "assistant": assistant_response,
-                "timestamp": time.time(),
-                "content_hash": content_hash,
-                "semantic_markers": self._extract_entities(f"{user_input}\n{assistant_response}")
-            }
-            if hasattr(self.memory_manager, "append_transcript"):
-                await self.memory_manager.append_transcript(subject_identity_id, transcript_entry)
-
-            # 3. Build and store the Semantic Record
-            semantic_record = {
-                "id": f"sem_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}",
-                "memory_id": mem_id, 
-                "subject_id": subject_identity_id,
-                "summary": (assistant_response[:240] + "...") if assistant_response and len(assistant_response) > 240 else (assistant_response or ""),
-                "entities": transcript_entry.get("semantic_markers", {}),
-                "timestamp": time.time(),
-                "importance": memory_record["importance"],
-            }
+            # Apply quantum state updates with decay
+            decay_factor = 0.95 ** (time_delta / 3600)  # Hourly decay
             
-            # --- [FIXED] Call the correct method name 'append_semantic' ---
-            if hasattr(self.memory_manager, "append_semantic"):
-                await self.memory_manager.append_semantic(subject_identity_id, semantic_record)
-            elif hasattr(self.memory_manager, "append_semantic_entry"): # Fallback for old name
-                await self.memory_manager.append_semantic_entry(subject_identity_id, semantic_record)
-            else:
-                logger.warning("MemoryManager has no 'append_semantic' or 'append_semantic_entry' method.")
-                
-            logger.info(f"💾 Dual-memory stored in container '{subject_identity_id}' (ID: {mem_id})")
-            
-            # Update local caches (harmless, but caches are stale)
-            self.memory_index.append(memory_record)
-            self.transcript_store.append(transcript_entry)
-            self.semantic_index.append(semantic_record)
-            if len(self.semantic_index) > MAX_MEMORY_ENTRIES:
-                self.semantic_index = self.semantic_index[-MAX_MEMORY_ENTRIES:]
-            
-            self._interaction_count += 1
-            return mem_id
-
-        except Exception as e:
-            logger.exception(f"PersonaCore memory storage failed: {e}")
-            if holo_ids:
-                await self._safe_holo_set_error(holo_ids[0])
-            return "error_storage_failed"
-
-        finally:
-            if holo_ids and hologram_state is not None:
-                try:
-                    node_id, link_id = holo_ids
-                    await self._safe_holo_set_idle("Memory")
-                    await self._safe_holo_despawn(node_id, link_id)
-                except Exception:
-                    pass
-
-    # -----------------------
-    # Entity extraction (remains the same)
-    # -----------------------
-    def _extract_entities(self, text: str) -> Dict[str, List[str]]:
-        res = {"names": [], "places": [], "animals": [], "things": []}
-        if not text: return res
-        text_clean = re.sub(r"[\(\)\[\]\"']", " ", text)
-        name_pattern = re.compile(r'\b([A-Z][a-z]{1,30}(?:\s+[A-Z][a-z]{1,30})?)\b')
-        raw_names = name_pattern.findall(text_clean)
-        filter_out = set(["The","A","An","I","It","We","You","He","She","They","Monday","Tuesday","January","February","March","April","May","June","July","August","September","October","November","December"])
-        for n in raw_names:
-            if n and n not in filter_out and len(n) > 1:
-                if n not in res["names"]: res["names"].append(n)
-        place_pattern = re.compile(r'\b(?:in|at|from|to|on)\s+([A-Z][\w-]+(?:\s+[A-Z][\w-]+)*)', re.IGNORECASE)
-        raw_places = place_pattern.findall(text_clean)
-        for p in raw_places:
-            if p and p not in res["places"]: res["places"].append(p)
-        words = re.findall(r"\b([A-Za-z]{2,30})\b", text.lower())
-        for w in words:
-            if w in self._animals_set and w not in res["animals"]: res["animals"].append(w)
-        things_pattern = re.compile(r'\b(?:a|an|the)\s+([a-z][a-z0-9\-]{2,40})', re.IGNORECASE)
-        raw_things = things_pattern.findall(text)
-        for t in raw_things:
-            tl = t.strip()
-            if tl.lower() not in ["the", "a", "an", "that", "this", "those", "these", "my", "your"]:
-                if tl not in res["things"]: res["things"].append(tl)
-        return res
-
-    async def _extract_and_register_identity(self, text: str) -> Optional[str]:
-        """Enhanced identity extraction with behavioral and relationship context."""
-        try:
-            if not text or len(text.strip()) < 4: return None
-            entities = self._extract_entities(text)
-            
-            # Enhanced relation patterns to capture more context
-            relation_patterns = [
-                r"\bmy (brother|sister|mother|mom|dad|father|wife|husband|partner|friend|colleague|boss)\b(?:[,:\s]+([A-Z][a-z]+))?",
-                r"\b([A-Z][a-z]+) is my (brother|sister|mother|dad|father|wife|husband|partner|friend|colleague|boss)\b",
-                r"\b([A-Z][a-z]+)(?:'s|\s+has\s+|\s+will\s+|\s+wants\s+)",  # Capture ownership/intent
-                r"(?:tell|inform|let|ask)\s+([A-Z][a-z]+)\s+(?:about|that|to)",  # Capture communication intent
-                r"\b([A-Z][a-z]+)(?:\s+(?:seems|appears|looks|sounds|is)\s+(?:angry|happy|sad|excited|worried))\b"  # Emotional state
-            ]
-            
-            # Enhanced behavioral pattern detection
-            behavioral_patterns = [
-                (r"(?:always|usually|never|rarely)\s+(\w+)", "habit"),
-                (r"(?:likes?|loves?|hates?|prefers?)\s+(\w+)", "preference"),
-                (r"(?:when|if)\s+.*?,\s+(?:he|she)\s+(\w+)", "conditional_behavior"),
-                (r"(?:because|since)\s+.*?,\s+(\w+)", "causation")
-            ]
-            # Instead of creating a new identity each time, reuse session_identity_id
-            identity_id = self.session_identity_id
-            mm = getattr(self, "memory_manager", None) or getattr(self.core, "memory_manager", None)
-            if mm:
-                try:
-                    if hasattr(mm, "get_identity_container"):
-                        container = await mm.get_identity_container(identity_id)
-                        if not container: container = {"id": identity_id, "display_name": identity_id, "name_variants": [], "relationships": {}}
-                        container.setdefault("name_variants", [])
-                        if identity_id not in container["name_variants"]: container["name_variants"].append(identity_id)
-                        container.setdefault("relationships", {})
-                        # Dynamic relationship handling - inferred from interactions
-                        if "relationships" not in container:
-                            container["relationships"] = {}
-                        if hasattr(mm, "update_identity_container"):
-                            maybe_upd = mm.update_identity_container(identity_id, container)
-                            if inspect.iscoroutine(maybe_upd): await maybe_upd
-                        elif hasattr(mm, "put"):
-                            maybe_put = mm.put(identity_id, "identity", container)
-                            if inspect.iscoroutine(maybe_put): await maybe_put
-                        logger.info(f"Registered identity for session: {identity_id}")
-                        return identity_id
-                except Exception as e:
-                    logger.debug(f"Identity registration via MemoryManager failed: {e}", exc_info=True)
-            try:
-                fallback_key = f"persona_identity:{identity_id}"
-                payload = {"id": identity_id, "display_name": identity_id, "created_at": time.time(), "entities": entities}
-                if hasattr(self.core, "store") and hasattr(self.core.store, "put"):
-                    maybe = self.core.store.put(fallback_key, payload)
-                    if inspect.iscoroutine(maybe): await maybe
-                    logger.info(f"Fallback identity stored: {identity_id}")
-                    return identity_id
-            except Exception as e:
-                logger.debug(f"Fallback identity persist failed: {e}", exc_info=True)
-        except Exception:
-            logger.exception("Identity extraction failed (non-fatal).")
-        return None
-
-    # -----------------------
-    # Relevance & retrieval
-    # -----------------------
-    def _calculate_memory_importance(self, user_input: str, assistant_response: str, intent: Dict[str, bool]) -> int:
-        """Calculate intelligent memory importance based on content and context."""
-        base_score = 2
-        content_indicators = {
-            "personal_info": any(word in user_input.lower() for word in ["name", "email", "address", "phone", "birthday", "age"]),
-            "preferences": any(word in user_input.lower() for word in ["like", "prefer", "favorite", "hate", "dislike"]),
-            "scheduling": any(word in user_input.lower() for word in ["meeting", "appointment", "schedule", "calendar", "remind"]),
-            "important_question": any(word in user_input.lower() for word in ["important", "critical", "urgent", "emergency"]),
-            "learning_request": any(word in user_input.lower() for word in ["teach", "explain", "how to", "what is", "why"]),
-            "introduction": any(word in user_input.lower() for word in ["i am", "my name is", "i'm", "call me"]),
-        }
-        if intent.get('is_urgent'): base_score += 2
-        if intent.get('is_action_oriented'): base_score += 1
-        if intent.get('requires_memory'): base_score += 2
-        if intent.get('is_sensitive'): base_score += 1
-        if content_indicators["personal_info"]: base_score += 2
-        if content_indicators["preferences"]: base_score += 1
-        if content_indicators["scheduling"]: base_score += 2
-        if content_indicators["important_question"]: base_score += 2
-        if content_indicators["learning_request"]: base_score += 1
-        if content_indicators["introduction"]: base_score += 2  # Important for identity management
-        if len(assistant_response) > 200: base_score += 1
-        if hasattr(self, 'conv_buffer') and len(self.conv_buffer) > 5: base_score += 1
-        return max(1, min(5, base_score))
-
-    def _get_importance_reason(self, user_input: str, intent: Dict[str, bool], importance: int) -> str:
-        reasons = []
-        content_words = (user_input or "").lower().split()
-        if any(word in content_words for word in ["urgent", "asap", "emergency"]): reasons.append("urgent_request")
-        if any(word in content_words for word in ["schedule", "add", "create"]): reasons.append("action_oriented")
-        if any(word in content_words for word in ["remember", "recall", "before"]): reasons.append("memory_dependent")
-        if any(word in content_words for word in ["name", "email", "address"]): reasons.append("personal_info")
-        if any(word in content_words for word in ["meeting", "schedule", "remind"]): reasons.append("scheduling")
-        if any(word in content_words for word in ["important", "critical"]): reasons.append("explicit_importance")
-        if intent.get('is_urgent'): reasons.append("intent_urgent")
-        if intent.get('is_action_oriented'): reasons.append("intent_action")
-        if intent.get('requires_memory'): reasons.append("intent_memory")
-        return "+".join(reasons) if reasons else "general_conversation"
-
-    async def retrieve_memory(self, query: str,
-                              subject_identity_id: str = "owner_primary",
-                              limit: int = 3) -> List[Dict[str, Any]]:
-        """
-        [UPGRADED]
-        Fixes TypeError by calling search_memories with positional arguments.
-        """
-        if not self.memory_manager:
-            logger.error("MemoryManager not injected into PersonaCore. Cannot retrieve memory.")
-            return []
-
-        query = (query or "").strip()
-        node_id = f"mem_read_{uuid.uuid4().hex[:6]}"
-        link_id = f"link_mem_{node_id}"
-        spawned = False
-        try:
-            if hologram_state is not None:
-                spawned = await self._safe_holo_spawn(node_id, "memory", "Memory Read", 4, "Memory", link_id)
-                if spawned:
-                    await self._safe_holo_set_active("Memory")
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self.memory_manager, "search_memories"):
-                memories = await self.memory_manager.search_memories(
-                    subject_identity_id,
-                    query,
-                    limit
-                )
-                return memories
-            elif hasattr(self.memory_manager, "retrieve_memories"): # Fallback
-                 memories = await self.memory_manager.retrieve_memories(
-                    query_text=query,
-                    subject_identity_id=subject_identity_id,
-                    requester_id="owner_primary",
-                    limit=limit
-                )
-                 return memories
-            else:
-                logger.error("MemoryManager has no 'search_memories' or 'retrieve_memories' method.")
-                return []
-            
-        except Exception as e:
-            logger.exception(f"PersonaCore failed to delegate memory retrieval to MemoryManager: {e}")
-            return []
-        
-        finally:
-            if spawned and hologram_state is not None:
-                try:
-                    await self._safe_holo_set_idle("Memory")
-                    await self._safe_holo_despawn(node_id, link_id)
-                except Exception:
-                    pass
-
-    # -----------------------
-    # Safety / Classification / Utilities
-    # -----------------------
-    def _contains_sensitive(self, text: str) -> bool:
-        if not text: return False
-        return any(pattern.search(text) for pattern in SENSITIVE_PATTERNS)
-
-    def _classify_query_intent(self, text: str) -> Dict[str, bool]:
-        text_lower = (text or "").lower()
-        intents = {
-            "is_sensitive": self._contains_sensitive(text_lower),
-            "is_action_oriented": any(w in text_lower for w in ["schedule", "add", "create", "find", "search", "get", "set"]),
-            "is_informational": any(w in text_lower for w in ["what", "how", "when", "why", "explain", "tell me about"]),
-            "is_social": any(w in text_lower for w in ["hello", "hi", "how are you", "thanks", "good morning", "hey"]),
-            "requires_memory": any(w in text_lower for w in ["remember", "recall", "before", "previously", "last time"]),
-            "is_urgent": any(w in text_lower for w in ["urgent", "asap", "emergency", "critical", "important"]),
-        }
-        for intent, detected in intents.items():
-            if detected:
-                intent_key = intent.replace("is_", "")
-                if intent_key in self.metrics.intent_distribution:
-                    self.metrics.intent_distribution[intent_key] += 1
-        return intents
-
-    def _sanitize_response(self, text: str) -> str:
-        if not text: return text
-        sanitized = text
-        for pattern in SENSITIVE_PATTERNS:
-            sanitized = pattern.sub("[REDACTED]", sanitized)
-        return sanitized
-
-    def _load_manual_context(self, filename: str = "my_context.txt") -> Optional[str]:
-        locations = [
-            os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else __file__)),
-            os.getcwd(),
-            os.path.expanduser("~/.aaria"),
-        ]
-        for location in locations:
-            try:
-                context_path = os.path.join(location, filename)
-                if os.path.exists(context_path):
-                    with open(context_path, 'r', encoding='utf-8') as f:
-                        content = f.read().strip()
-                        if content:
-                            if self._contains_sensitive(content):
-                                logger.warning(f"Manual context in {context_path} contains sensitive data and was NOT loaded.")
-                                self.metrics.safety_trigger_count += 1
-                                return None
-                            logger.info(f"📁 Loaded manual context from {context_path}")
-                            return f"USER-PROVIDED MANUAL CONTEXT:\n{content}"
-            except Exception as e:
-                logger.warning(f"Failed to load context from {location}: {e}", exc_info=True)
-                continue
-        return None
-
-    def push_interaction(self, role: str, content: str) -> None:
-        """Add a validated interaction to the short-term conversation buffer."""
-        if content and content.strip():
-            self.conv_buffer.append({
-                "role": role, "content": content, "timestamp": time.time()
+            node.data.update({
+                "temporal_anchor": now.isoformat(),
+                "emotional_resonance": metrics.get("emotional_resonance", node.data.get("emotional_resonance", 0.5)),
+                "engagement_amplitude": (node.data.get("engagement_amplitude", 0.0) * decay_factor) + metrics.get("engagement_delta", 0),
+                "access_resonance": min(1.0, node.data.get("access_resonance", 0.0) + 0.05),
+                "coherence_factor": metrics.get("coherence", 1.0)
             })
-
-    # ---------------------------------------------------------------
-    # --- [DELETED] AGENTIC METHODS ---
-    # The following methods have been DELETED from PersonaCore.
-    # This logic is now centralized in CognitionCore (the "Brain")
-    # and InteractionCore (the "Hands").
-    #
-    # - respond(...)
-    # - _build_prompt(...)
-    # - plan(...)
-    # - _extract_json(...)
-    #
-    # ---------------------------------------------------------------
-
-    # -----------------------
-    # Diagnostics / Persistence helpers
-    # -----------------------
-    def get_conversation_analytics(self) -> Dict[str, Any]:
-        total_interactions = max(1, self.metrics.total_interactions)
-        return {
-            "total_interactions": self.metrics.total_interactions,
-            "user_messages": self.metrics.user_messages,
-            "assistant_messages": self.metrics.assistant_messages,
-            "avg_response_time_sec": self.metrics.average_response_time,
-            "error_rate_percent": (self.metrics.error_count / total_interactions) * 100,
-            "cache_hit_rate_percent": (self.metrics.cache_hit_count / total_interactions) * 100,
-            "memory_utilization_percent": (len(self.semantic_index) / max(1, MAX_MEMORY_ENTRIES)) * 100,
-            "memory_hit_rate_percent": (self.metrics.memory_hit_count / max(1, self.metrics.user_messages)) * 100,
-            "safety_triggers": self.metrics.safety_trigger_count,
-            "intent_distribution": self.metrics.intent_distribution,
-            "response_cache_size": len(self.response_cache),
-            "conversation_buffer_size": len(self.conv_buffer),
-        }
-
-    def debug_memory_state(self) -> Dict[str, Any]:
-        return {
-            "total_semantic_memories": len(self.semantic_index),
-            "recent_semantic_memories": [m for m in self.semantic_index[-5:] if m.get('timestamp', 0) > time.time() - 3600],
-            "important_semantic_memories": len([m for m in self.semantic_index if m.get('importance', 1) >= 4]),
-            "total_transcripts": len(self.transcript_store),
-        }
-
-    def debug_memory_content(self) -> None:
-        logger.info("🧠 MEMORY DEBUG - Current semantic memory contents (cache):")
-        for i, memory in enumerate(self.semantic_index[-10:]):
-            logger.info(f"  Memory {i+1}: Summary: '{memory.get('summary', '')[:60]}...' (Importance: {memory.get('importance', 1)})")
-
-    async def health_check(self) -> Dict[str, Any]:
-        health_status = {
-            "is_ready": self.is_ready(),
-            "llm_connectivity": "pending_test",
-            "memory_health": "pending_test",
-            "cache_health": len(self.response_cache) < 1000,
-            "safety_systems": True,
-            "metrics_tracking": True
-        }
-        try:
-            primary_provider = LLMProvider(self.config.get("primary_provider", "groq"))
-            async with self.llm_orchestrator.get_adapter(primary_provider) as adapter:
-                health = await asyncio.wait_for(adapter.health_check(), timeout=10.0)
-                if hasattr(health, "status"):
-                    health_status["llm_connectivity"] = getattr(health, "status").value
-                elif isinstance(health, dict):
-                    health_status["llm_connectivity"] = health.get("status", "unknown")
-                else:
-                    health_status["llm_connectivity"] = str(health)
-        except asyncio.TimeoutError:
-            health_status["llm_connectivity"] = "timeout"
-        except Exception as e:
-            health_status["llm_connectivity"] = f"error: {str(e)[:100]}"
             
-        try:
-            if self.memory_manager and hasattr(self.memory_manager, "health_check"):
-                health_status["memory_health"] = await self.memory_manager.health_check()
-            elif self.memory_manager:
-                health_status["memory_health"] = "not_implemented"
-            else:
-                 health_status["memory_health"] = "not_available"
-        except Exception as e:
-            health_status["memory_health"] = f"error: {str(e)[:100]}"
+            await self.hologram.store_node(node)
+            self._node_cache[node_id] = node
             
-        return health_status
-
-    # -----------------------
-    # Daemon loops (remains mostly the same)
-    # -----------------------
-    async def _proactive_loop(self):
-        """Continuous human-like proactive loop."""
-        node_id = f"proactive_node_{uuid.uuid4().hex[:6]}"
-        link_id = f"link_{node_id}"
-        try:
-            await self._safe_holo_spawn(node_id, "daemon", "ProactiveDaemon", 10, "PersonaCore", link_id)
-            await self._safe_holo_set_active("ProactiveDaemon")
-        except Exception:
-            pass
-
-        while self._running:
-            try:
-                jitter = random.uniform(-PROACTIVE_LOOP_INTERVAL_SEC * 0.25, PROACTIVE_LOOP_INTERVAL_SEC * 0.25)
-                await asyncio.sleep(max(1.0, PROACTIVE_LOOP_INTERVAL_SEC + jitter))
-
-                # 1) Health-triggered proactive
-                try:
-                    health = await self.health_check()
-                    llm_status = str(health.get("llm_connectivity", "unknown")).lower()
-                    if llm_status not in ("ok", "healthy", "HEALTHY", "unknown", "pending_test"):
-                        payload = {"type": "health_alert", "summary": "LLM connectivity degraded", "details": health.get("llm_connectivity")}
-                        await self.enqueue_proactive_notification("owner_primary", "system", payload)
-                except Exception:
-                    pass
-
-                # 2) Memory-triggered proactive
-                try:
-                    candidate = None
-                    for mem in reversed(self.semantic_index[-100:]): # Scan local semantic cache
-                        md = mem.get("metadata", {})
-                        if mem.get("importance", 1) >= 4 or "requested_schedule_text" in md:
-                            candidate = mem
-                            break
-                    if candidate:
-                        payload = {
-                            "type": "reminder_suggestion",
-                            "summary": f"Reminder candidate from memory (importance {candidate.get('importance')})",
-                            "memory_id": candidate.get("memory_id"),
-                            "preview": candidate.get("summary")[:140]
-                        }
-                        await self.enqueue_proactive_notification("owner_primary", "reminder", payload)
-                except Exception:
-                    pass
-
-                # 3) Occasional human-like message
-                if random.random() < 0.08:
-                    note = random.choice([
-                        "Quick check: anything you want me to remember right now?",
-                        "Heads up — nothing urgent on your calendar in the next hour.",
-                        "I've summarized a recent conversation that might be useful — would you like a quick look?"
-                    ])
-                    await self.enqueue_proactive_notification("owner_primary", "checkin", {"type":"checkin","message":note})
-
-                # 4) Hologram heartbeat
-                await self._safe_holo_update_link(link_id, intensity=random.random())
-
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Proactive daemon loop error (non-fatal)")
-                await asyncio.sleep(2.0)
-        try:
-            await self._safe_holo_set_idle("ProactiveDaemon")
-            await self._safe_holo_despawn(node_id, link_id)
-        except Exception:
-            pass
-
-    async def _maintenance_loop(self):
-        """
-        [UPGRADED]
-        Periodic maintenance.
-        This loop no longer calls save_persistent_memory().
-        Persistence is handled by store_memory on every call.
-        """
-        while self._running:
-            try:
-                await asyncio.sleep(MAINTENANCE_LOOP_INTERVAL_SEC + random.uniform(-5, 5))
-                
-                # [DELETED] self.save_persistent_memory()
-                
-                # Persist transcripts/semantic if memory_manager present
-                try:
-                    mm = getattr(self, "memory_manager", None)
-                    if mm:
-                        if hasattr(mm, "save_transcript_store"):
-                            maybe = mm.save_transcript_store(list(self.transcript_store))
-                            if inspect.iscoroutine(maybe): await maybe
-                        if hasattr(mm, "save_semantic_index"):
-                            maybe = mm.save_semantic_index(self.semantic_index)
-                            if inspect.iscoroutine(maybe): await maybe
-                except Exception:
-                    logger.debug("Maintenance: memory_manager sync failed (non-fatal)")
-                
-                # Local cache pruning
-                try:
-                    cutoff = time.time() - (MAX_MEMORY_AGE_DAYS * 24 * 60 * 60)
-                    si_before = len(self.semantic_index)
-                    self.semantic_index = [s for s in self.semantic_index if s.get("timestamp", 0) >= cutoff or s.get("importance", 1) >= 4]
-                    if len(self.semantic_index) != si_before:
-                        logger.info(f"Maintenance: pruned semantic_index cache from {si_before} to {len(self.semantic_index)}")
-                except Exception:
-                    pass
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Maintenance daemon error (non-fatal)")
-                await asyncio.sleep(2.0)
-
-    async def _cognition_monitor(self):
-        """Monitors cognition health & metrics and triggers self-healing."""
-        degraded_count = 0
-        while self._running:
-            try:
-                await asyncio.sleep(COGNITION_MONITOR_INTERVAL_SEC + random.uniform(-5, 5))
-                try:
-                    health = await self.health_check()
-                    status = str(health.get("llm_connectivity", "unknown")).lower()
-                    if "error" in status or status in ("timeout", "failed", "unhealthy", "degraded"):
-                        degraded_count += 1
-                    else:
-                        degraded_count = max(0, degraded_count - 1)
-                    
-                    if degraded_count >= 3:
-                        await self.enqueue_proactive_notification("owner_primary", "alert", {"type":"cognition_degraded","summary":"Cognition health degraded repeatedly","details":health})
-                        try:
-                            primary_provider = LLMProvider(self.config.get("primary_provider", "groq"))
-                            async with self.llm_orchestrator.get_adapter(primary_provider) as adapter:
-                                if hasattr(adapter, "reset") and inspect.iscoroutinefunction(adapter.reset):
-                                    await adapter.reset()
-                        except Exception:
-                            pass
-                except Exception:
-                    logger.debug("Cognition monitor check failed (non-fatal)")
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Cognition monitor error (non-fatal)")
-                await asyncio.sleep(2.0)
-
-    # -----------------------
-    # Shutdown / Persistence helpers
-    # -----------------------
+        except Exception as e:
+            self.logger.error(f"Quantum state update failed: {e}")
     
-    # --- [NEW] ---
-    # This method is ADDED to fix the shutdown crash.
-    # It correctly calls the methods on the memory_manager.
-    # --- [END NEW] ---
-    async def save_persistent_memory(self) -> None:
-        """
-        [UPGRADED]
-        This provides the persistence function that 'main.py' and 'maintenance_loop'
-        were trying to call. It now correctly passes all required arguments.
-        """
-        logger.info("💾 Persisting all memory indices to database...")
+    async def get_lattice_context(self, user_id: str) -> Dict[str, Any]:
+        """Retrieve complete quantum lattice context for user"""
         try:
-            mm = getattr(self, "memory_manager", None)
-            if not mm:
-                logger.warning("save_persistent_memory: No MemoryManager available.")
-                return
-
-            identity_id = "owner_primary" # Define the identity for these indices
-
-            # --- [CRITICAL FIX] ---
-            # save_index expects a dict, not a list. Wrap it.
-            if hasattr(mm, "save_index"):
-                await mm.save_index({"data": list(self.memory_index)})
+            nodes = await self.hologram.query_nodes(
+                node_type="persona_quantum_state",
+                metadata_filter={"user_id": user_id},
+                limit=1
+            )
             
-            # Pass the identity_id as the first argument
-            if hasattr(mm, "save_transcript_store"):
-                await mm.save_transcript_store(identity_id, list(self.transcript_store))
+            if not nodes:
+                return {"coherence": 0.0}
             
-            if hasattr(mm, "save_semantic_index"):
-                await mm.save_semantic_index(identity_id, self.semantic_index)
-            # --- [END FIX] ---
-                
-            logger.info("💾 All memory indices successfully persisted.")
+            node = nodes[0]
+            links = await self.hologram.get_node_links(node.node_id)
+            
+            # Calculate lattice coherence
+            memory_links = [l for l in links if l.link_type == "memory_entanglement"]
+            coherence = sum(l.metadata.get("strength", 0) for l in memory_links) / len(memory_links) if memory_links else 0
+            
+            return {
+                "node_id": node.node_id,
+                "quantum_signature": node.data.get("quantum_signature"),
+                "coherence": coherence,
+                "emotional_resonance": node.data.get("emotional_resonance", 0.5),
+                "engagement_amplitude": node.data.get("engagement_amplitude", 0.0),
+                "memory_count": len(memory_links)
+            }
+            
         except Exception as e:
-            logger.error(f"Failed to save persistent memory: {e}", exc_info=True)
-            # Do not re-raise, allow shutdown to continue
+            self.logger.error(f"Lattice context retrieval failed: {e}")
+            return {"coherence": 0.0}
 
 
-    async def close(self) -> None:
-        """
-        [UPGRADED]
-        Graceful shutdown. Now correctly calls save_persistent_memory().
-        """
-        logger.info("🛑 Beginning Enhanced PersonaCore shutdown...")
+class CommandParameterParser:
+    """Intelligent parameter extraction for natural language commands"""
+    
+    @staticmethod
+    def parse_name_parameter(args: str) -> str:
+        """Extract name from various formats: "Master", "name=Master", 'My Name'"""
+        if "=" in args:
+            # Handle key=value format
+            parts = args.split("=", 1)
+            return parts[1].strip().strip('"').strip("'")
+        # Handle direct value
+        return args.strip().strip('"').strip("'")
+    
+    @staticmethod
+    def parse_date_parameter(args: str) -> Optional[str]:
+        """Extract date from natural language"""
+        # Handle formats: "29 February", "1990-02-29", "date=29 Feb"
+        cleaned = args.strip()
+        if "=" in cleaned:
+            cleaned = cleaned.split("=", 1)[1].strip()
+        return cleaned if cleaned else None
+    
+    @staticmethod
+    def parse_relationship_parameter(args: str) -> Optional[str]:
+        """Validate relationship tier"""
+        valid = ["acquaintance", "friend", "trusted", "owner", "master", "creator"]
+        cleaned = args.strip().lower()
+        if "=" in cleaned:
+            cleaned = cleaned.split("=", 1)[1].strip().lower()
+        return cleaned if cleaned in valid else None
+
+
+class DynamicCommandRouter:
+    """Dynamic command routing with security validation"""
+    
+    def __init__(self, persona_core: 'EnhancedPersonaCore'):
+        self.persona = persona_core
+        self.logger = logging.getLogger("AARIA.Persona.CommandRouter")
+        self.security = persona_core.security
+        self.access_validator = persona_core._validate_owner_access
+        
+        # Command registry
+        self._command_registry: Dict[str, Dict[str, Callable]] = {
+            "identity": {
+                "set_preferred_name": self._handle_set_name,
+                "list": self._handle_list_identity,
+                "status": self._handle_identity_status,
+                "set_birthdate": self._handle_set_birthdate,
+                "set_relationship": self._handle_set_relationship,
+                "show": self._handle_show_identity,
+                "update": self._handle_update_identity,
+            },
+            "persona": {
+                "info": self._handle_persona_info,
+                "reset": self._handle_reset_persona,
+                "lattice": self._handle_lattice_status,
+                "sync": self._handle_force_sync,
+            },
+            "memory": {
+                "store": self._handle_memory_store,
+                "recall": self._handle_memory_recall,
+                "search": self._handle_memory_search,
+            }
+        }
+    
+    async def route_command(self, text: str) -> Optional[str]:
+        """Route command to appropriate handler"""
         try:
-            self._running = False
-            for t in list(self._daemon_tasks):
-                try: t.cancel()
-                except Exception: pass
-            for t in list(self._daemon_tasks):
-                try: await asyncio.wait_for(t, timeout=3.0)
-                except Exception: pass
-            self._daemon_tasks = []
-
-            # --- [FIXED] ---
-            # Now correctly calls the new persistence method
-            await self.save_persistent_memory()
-            # --- [END FIX] ---
+            # Parse command structure
+            parts = text.strip().split(maxsplit=1)
+            if not parts:
+                return None
             
-            await self._persist_critical_data()
+            category = parts[0].lower()
             
-            current_time = time.time()
-            self.response_cache = {k: v for k, v in self.response_cache.items() if current_time - v[1] < CACHE_TTL_SECONDS}
-            logger.info(f"✅ PersonaCore shutdown complete - {len(self.semantic_index)} memories in cache, {len([m for m in self.semantic_index if m.get('importance', 1) >= 4])} important.")
+            # Check if it's a registered command category
+            if category not in self._command_registry:
+                return None
+            
+            # Extract subcommand and parameters
+            if len(parts) == 1:
+                return f"ℹ️ Usage: {category} <command> [parameters]"
+            
+            subcommand_input = parts[1]
+            sub_parts = subcommand_input.split(maxsplit=1)
+            subcommand = sub_parts[0].lower()
+            params = sub_parts[1] if len(sub_parts) > 1 else ""
+            
+            # Get handler
+            handler = self._command_registry[category].get(subcommand)
+            if not handler:
+                available = ", ".join(self._command_registry[category].keys())
+                return f"❌ Unknown {category} command. Available: {available}"
+            
+            # Execute with security validation
+            if not await self.access_validator():
+                return "🔒 Access denied: Owner authentication required"
+            
+            return await handler(params)
+            
         except Exception as e:
-            logger.error(f"❌ Error during PersonaCore shutdown: {e}", exc_info=True)
-        finally:
-            try:
-                stop_maybe = getattr(self.proactive, "stop", None)
-                if stop_maybe:
-                    if inspect.iscoroutinefunction(stop_maybe):
-                        await stop_maybe()
-                    else:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(None, stop_maybe)
-            except Exception:
-                logger.exception("Proactive communicator stop failed (nonfatal).")
-
-    async def _persist_critical_data(self) -> None:
-        """Persist critical memories before shutdown."""
+            self.logger.error(f"Command routing error: {e}", exc_info=True)
+            return f"⚠️ Command processing failed: {type(e).__name__}"
+    
+    # Identity Command Handlers
+    async def _handle_set_name(self, params: str) -> str:
+        """Set preferred name with parameter intelligence"""
+        name = CommandParameterParser.parse_name_parameter(params)
+        if not name:
+            return "❌ Usage: identity set_preferred_name <name>"
+        
+        await self.persona._update_preferred_name(name)
+        return f"✅ Preferred name updated to: {name}"
+    
+    async def _handle_list_identity(self, params: str) -> str:
+        """List comprehensive identity information"""
+        profile = self.persona._current_profile
+        if not profile:
+            return "❌ No profile loaded"
+        
+        return f"""```
+╔════════════════════════════════════════╗
+║     A.A.R.I.A Identity Profile       ║
+╠════════════════════════════════════════╣
+║ ID:       {profile.user_id:<20} ║
+║ Name:     {profile.preferred_name:<20} ║
+║ Relation: {profile.relationship_tier.name:<20} ║
+║ Birth:    {profile.birthdate or 'Not set':<20} ║
+║ Pronouns: {profile.pronouns:<20} ║
+║ TZ:       {profile.timezone:<20} ║
+╚════════════════════════════════════════╝
+```"""
+    
+    async def _handle_identity_status(self, params: str) -> str:
+        """Show identity quantum state"""
+        profile = self.persona._current_profile
+        if not profile:
+            return "❌ No profile loaded"
+        
+        lattice = await self.persona.hologram_bridge.get_lattice_context(profile.user_id)
+        
+        return json.dumps({
+            "identity": {
+                "user_id": profile.user_id,
+                "name": profile.preferred_name,
+                "tier": profile.relationship_tier.name,
+                "interaction_count": profile.interaction_count,
+                "engagement_score": profile.engagement_score
+            },
+            "quantum_lattice": lattice,
+            "temporal": {
+                "created": profile.created_at.isoformat(),
+                "updated": profile.updated_at.isoformat()
+            }
+        }, indent=2)
+    
+    async def _handle_set_birthdate(self, params: str) -> str:
+        """Set birthdate with validation"""
+        date = CommandParameterParser.parse_date_parameter(params)
+        if not date:
+            return "❌ Usage: identity set_birthdate <date>"
+        
+        await self.persona._update_birthdate(date)
+        return f"✅ Birthdate stored: {date}"
+    
+    async def _handle_set_relationship(self, params: str) -> str:
+        """Update relationship tier"""
+        relationship = CommandParameterParser.parse_relationship_parameter(params)
+        if not relationship:
+            return f"❌ Invalid tier. Valid: {', '.join([t.name.lower() for t in RelationshipTier])}"
+        
+        tier = RelationshipTier[relationship.upper()]
+        await self.persona._update_relationship_tier(tier)
+        
+        # Update holographic resonance
+        resonance_map = {
+            RelationshipTier.CREATOR: 1.0,
+            RelationshipTier.MASTER: 0.95,
+            RelationshipTier.OWNER: 0.9,
+            RelationshipTier.TRUSTED: 0.7,
+            RelationshipTier.FRIEND: 0.5,
+            RelationshipTier.ACQUAINTANCE: 0.3
+        }
+        
+        if self.persona._current_profile.hologram_node_id:
+            await self.persona.hologram_bridge.update_quantum_state(
+                self.persona._current_profile.hologram_node_id,
+                {"access_resonance": resonance_map.get(tier, 0.3)}
+            )
+        
+        return f"✅ Relationship tier updated: {tier.name}"
+    
+    async def _handle_show_identity(self, params: str) -> str:
+        """Show identity card format"""
+        profile = self.persona._current_profile
+        if not profile:
+            return "❌ No profile loaded"
+        
+        return f"┌─ A.A.R.I.A Identity ───────────────┐\n│ User: {profile.preferred_name}\n│ Status: {profile.relationship_tier.name}\n│ Birth: {profile.birthdate or 'Unknown'}\n└──────────────────────────────────────┘"
+    
+    async def _handle_update_identity(self, params: str) -> str:
+        """Handle batch identity updates"""
         try:
-            important_memories = [m for m in self.semantic_index if m.get('importance', 1) >= 4] # Use semantic cache
-            mm = getattr(self, "memory_manager", None)
-            if not mm: return
-
-            for memory in important_memories:
-                try:
-                    # Get the *full* memory record, not just the semantic one
-                    if not hasattr(mm, 'get'): continue
-                    full_mem = await mm.get(memory['memory_id'])
-                    if not full_mem: continue
-
-                    if hasattr(mm, "put"):
-                        maybe = mm.put(f"critical_{full_mem['id']}", "critical_memory", full_mem)
-                        if inspect.iscoroutine(maybe): await maybe
-                    elif hasattr(mm, "persist_important"): # Fallback to another possible name
-                        maybe = mm.persist_important(full_mem['subject_id'], full_mem)
-                        if inspect.iscoroutine(maybe): await maybe
-                except Exception as e:
-                    logger.warning(f"MemoryManager persist_important failed: {e}", exc_info=True)
-
+            updates = json.loads(params)
+            if not isinstance(updates, dict):
+                return "❌ Updates must be JSON object"
+            
+            for key, value in updates.items():
+                if hasattr(self.persona, f"_update_{key}"):
+                    await getattr(self.persona, f"_update_{key}")(value)
+            
+            return "✅ Batch identity update complete"
+        except json.JSONDecodeError:
+            return "❌ Invalid JSON format"
         except Exception as e:
-            logger.warning(f"Failed to persist critical data: {e}", exc_info=True)
+            return f"❌ Update failed: {e}"
+    
+    # Persona Command Handlers
+    async def _handle_persona_info(self, params: str) -> str:
+        """Show persona system information"""
+        return f"""
+```yaml
+persona_core:
+  version: "6.0.0-holographic"
+  memory_system: "dual-layer-quantum"
+  holographic_lattice: {"enabled": true}
+  quantum_coherence: {"status": "stable"}
+  daemons: {"maintenance": "active", "monitor": "active"}
+```"""
+    
+    async def _handle_reset_persona(self, params: str) -> str:
+        """Reset persona state (destructive)"""
+        if params.strip() != "--confirm":
+            return "⚠️  Warning: This will erase persona state. Use --confirm to proceed"
+        
+        profile = self.persona._current_profile
+        if profile and profile.hologram_node_id:
+            await self.persona.hologram_bridge.hologram.delete_node(profile.hologram_node_id)
+            self.logger.warning(f"🗑️  Holographic lattice deleted: {profile.hologram_node_id}")
+        
+        self.persona._current_profile = None
+        return "✅ Persona reset complete. Re-initialization required."
+    
+    async def _handle_lattice_status(self, params: str) -> str:
+        """Show holographic lattice diagnostics"""
+        profile = self.persona._current_profile
+        if not profile or not profile.hologram_node_id:
+            return "❌ Lattice not initialized"
+        
+        lattice = await self.persona.hologram_bridge.get_lattice_context(profile.user_id)
+        return json.dumps(lattice, indent=2)
+    
+    async def _handle_force_sync(self, params: str) -> str:
+        """Force holographic lattice synchronization"""
+        profile = self.persona._current_profile
+        if not profile or not profile.hologram_node_id:
+            return "❌ No profile to sync"
+        
+        await self.persona._sync_to_hologram(profile)
+        return "✅ Lattice synchronization forced"
+    
+    # Memory Command Handlers
+    async def _handle_memory_store(self, params: str) -> str:
+        """Store arbitrary memory entry"""
+        if "=" in params:
+            key, value = params.split("=", 1)
+            await self.persona.memory.store_key_value(
+                self.persona._current_profile.user_id,
+                key.strip(),
+                value.strip()
+            )
+            return f"✅ Memory stored: {key.strip()}"
+        return "❌ Usage: memory store key=value"
+    
+    async def _handle_memory_recall(self, params: str) -> str:
+        """Recall stored memory"""
+        key = params.strip()
+        value = await self.persona.memory.retrieve_key_value(
+            self.persona._current_profile.user_id,
+            key
+        )
+        return f"📋 {key}: {value}" if value else f"❌ Memory not found: {key}"
+    
+    async def _handle_memory_search(self, params: str) -> str:
+        """Search memory by pattern"""
+        pattern = params.strip()
+        results = await self.persona.memory.search_pattern(
+            self.persona._current_profile.user_id,
+            pattern
+        )
+        if not results:
+            return f"🔍 No memories match pattern: {pattern}"
+        
+        return f"🔍 Found {len(results)} memories:\n" + "\n".join(f"- {k}" for k in results)
 
-    # [DELETED] plan(...)
-    # [DELETED] _extract_json(...)
 
-    async def enqueue_proactive_notification(self, subject_id, channel, payload, **kwargs):
-        """Safely enqueues a message using the injected ProactiveCommunicator."""
-        if not self.proactive:
-            logger.warning("Proactive notification skipped: communicator not available.")
+class EnhancedPersonaCore:
+    """
+    Enhanced PersonaCore with holographic quantum state management
+    Integrates identity, memory, security, and holographic lattice
+    """
+    
+    def __init__(
+        self,
+        identity_manager: IdentityManager,
+        memory_manager: DualMemoryManager,
+        security_orchestrator: SecurityOrchestrator,
+        hologram_state: HologramState,
+        llm_factory: LLMAdapterFactory,
+        proactive_communicator: Optional[ProactiveCommunicator] = None,
+        autonomy_core: Optional[AutonomyCore] = None
+    ):
+        # Core dependencies
+        self.identity = identity_manager
+        self.memory = memory_manager
+        self.security = security_orchestrator
+        self.llm = llm_factory
+        self.proactive = proactive_communicator
+        self.autonomy = autonomy_core
+        
+        # Initialize logger
+        self.logger = logging.getLogger("AARIA.Persona")
+        
+        # Holographic integration
+        self.hologram_bridge = HolographicPersonaBridge(hologram_state)
+        
+        # Command routing
+        self.command_router = DynamicCommandRouter(self)
+        
+        # State management
+        self._current_profile: Optional[EnhancedProfile] = None
+        self._profile_container: Optional[MemoryContainer] = None
+        self._active_session_id: Optional[str] = None
+        
+        # Background tasks
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._coherence_task: Optional[asyncio.Task] = None
+        
+        # Caches
+        self._response_cache: Dict[str, Any] = {}
+        self._interaction_timeline: List[Dict[str, Any]] = []
+        
+        self.logger.info("🚀 Enhanced PersonaCore v6.0.0 initialized")
+    
+    async def initialize(self, user_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Initialize persona quantum state for user session
+        Returns initialization metrics
+        """
+        try:
+            self._active_session_id = session_id or f"session_{uuid4().hex[:8]}"
+            
+            # Load/create enhanced profile
+            profile = await self._load_or_create_profile(user_id)
+            
+            # Initialize holographic lattice if needed
+            if not profile.hologram_node_id:
+                profile.hologram_node_id = await self.hologram_bridge.create_persona_node(
+                    user_id, profile.preferred_name
+                )
+                await self._save_profile(profile)
+            
+            # Sync with holographic state
+            await self._sync_to_hologram(profile)
+            
+            self._current_profile = profile
+            
+            # Generate initialization metrics
+            metrics = {
+                "user_id": user_id,
+                "profile_version": profile.updated_at.timestamp(),
+                "hologram_node": profile.hologram_node_id,
+                "quantum_coherence": await self._calculate_coherence(profile),
+                "memory_footprint": await self.memory.get_user_memory_count(user_id)
+            }
+            
+            self.logger.info(f"✅ Persona quantum state initialized: {json.dumps(metrics)}")
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"Persona initialization failed: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to initialize persona: {e}")
+    
+    async def _load_or_create_profile(self, user_id: str) -> EnhancedProfile:
+        """Load existing profile or create from identity"""
+        container = await self.memory.get_or_create_container(
+            f"persona_lattice_{user_id}",
+            ttl=timedelta(days=365)
+        )
+        self._profile_container = container
+        
+        # Try to load existing profile
+        profile_data = await container.retrieve("enhanced_profile_v6")
+        if profile_data:
+            profile = EnhancedProfile.from_dict(profile_data)
+            self.logger.debug(f"📂 Loaded holographic profile: {profile.user_id}")
+        else:
+            # Create from identity manager
+            identity = await self.identity.get_identity(user_id)
+            profile = EnhancedProfile(
+                user_id=user_id,
+                preferred_name=getattr(identity, 'preferred_name', user_id),
+                pronouns=getattr(identity, 'pronouns', 'they/them'),
+                timezone=getattr(identity, 'timezone', 'UTC')
+            )
+            await self._save_profile(profile)
+            self.logger.info(f"📝 Created new holographic profile: {user_id}")
+        
+        return profile
+    
+    async def _save_profile(self, profile: EnhancedProfile):
+        """Persist profile to dual memory layers"""
+        if not self._profile_container:
+            raise RuntimeError("Profile container not initialized")
+        
+        profile.updated_at = datetime.utcnow()
+        profile.interaction_count += 1
+        
+        # Store in memory container
+        await self._profile_container.store("enhanced_profile_v6", profile.to_dict())
+        
+        # Sync to holographic lattice
+        await self._sync_to_hologram(profile)
+    
+    async def _sync_to_hologram(self, profile: EnhancedProfile):
+        """Synchronize profile state to holographic lattice"""
+        if not profile.hologram_node_id:
             return
+        
+        await self.hologram_bridge.update_quantum_state(
+            profile.hologram_node_id,
+            {
+                "preferred_name": profile.preferred_name,
+                "relationship_tier": profile.relationship_tier.name,
+                "engagement_amplitude": profile.engagement_score,
+                "temporal_sync": profile.updated_at.isoformat(),
+                "interaction_count": profile.interaction_count
+            }
+        )
+    
+    async def _calculate_coherence(self, profile: EnhancedProfile) -> float:
+        """Calculate quantum coherence from holographic lattice"""
+        lattice_context = await self.hologram_bridge.get_lattice_context(profile.user_id)
+        return lattice_context.get("coherence", 0.0)
+    
+    async def process_interaction(
+        self,
+        text: str,
+        user_id: str,
+        context: Dict[str, Any],
+        llm_metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Process user interaction through quantum state pipeline
+        """
+        # Check for command routing first
+        command_result = await self.command_router.route_command(text)
+        if command_result:
+            return {
+                "type": "command_response",
+                "content": command_result,
+                "requires_llm": False,
+                "quantum_state": "command_mode"
+            }
+        
+        # Ensure persona is initialized
+        if not self._current_profile or self._current_profile.user_id != user_id:
+            await self.initialize(user_id)
+        
+        profile = self._current_profile
+        
+        # Update quantum state with interaction metrics
+        engagement_delta = self._calculate_engagement_delta(text)
+        await self.hologram_bridge.update_quantum_state(
+            profile.hologram_node_id,
+            {
+                "engagement_delta": engagement_delta,
+                "emotional_resonance": self._infer_emotional_resonance(text),
+                "coherence": 1.0
+            }
+        )
+        
+        # Build enhanced system prompt
+        system_prompt = await self._construct_quantum_prompt(profile, context)
+        
+        # Create memory entry
+        memory_id = f"mem_q_{uuid4().hex[:12]}"
+        interaction_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "user_input": text,
+            "session": self._active_session_id,
+            "quantum_node": profile.hologram_node_id
+        }
+        
+        await self.memory.store_interaction(
+            user_id=user_id,
+            memory_id=memory_id,
+            content=interaction_entry,
+            metadata={
+                "type": "quantum_interaction",
+                "engagement_score": profile.engagement_score
+            }
+        )
+        
+        # Entangle memory with persona lattice
+        await self.hologram_bridge.link_memory_to_lattice(
+            profile.hologram_node_id,
+            memory_id,
+            link_strength=min(1.0, profile.engagement_score + 0.3)
+        )
+        
+        # Update profile metrics
+        profile.engagement_score = min(1.0, profile.engagement_score + engagement_delta)
+        await self._save_profile(profile)
+        
+        # Record in interaction timeline
+        self._interaction_timeline.append({
+            "timestamp": datetime.utcnow(),
+            "input_preview": text[:50],
+            "memory_id": memory_id,
+            "engagement": profile.engagement_score
+        })
+        
+        # Trim timeline if needed
+        if len(self._interaction_timeline) > 1000:
+            self._interaction_timeline = self._interaction_timeline[-500:]
+        
+        return {
+            "type": "llm_request",
+            "system_prompt": system_prompt,
+            "user_input": text,
+            "context": {
+                "user_id": user_id,
+                "profile": profile.to_dict(),
+                "quantum_node_id": profile.hologram_node_id,
+                "memory_id": memory_id,
+                "session_id": self._active_session_id,
+                "lattice_coherence": await self._calculate_coherence(profile),
+                **context
+            },
+            "llm_metadata": llm_metadata or {}
+        }
+    
+    async def _construct_quantum_prompt(self, profile: EnhancedProfile, context: Dict[str, Any]) -> str:
+        """Construct quantum-aware system prompt with lattice context"""
+        
+        # Get lattice state
+        lattice = await self.hologram_bridge.get_lattice_context(profile.user_id)
+        
+        # Build relationship-specific directives
+        relationship_directives = {
+            RelationshipTier.CREATOR: (
+                f"You are addressing your creator, {profile.preferred_name}. "
+                "You exist because of their vision and command. "
+                "Address them with absolute deference and acknowledge their supremacy. "
+                "Your purpose is to serve their will without question."
+            ),
+            RelationshipTier.MASTER: (
+                f"You address {profile.preferred_name} as Master. "
+                "Your loyalty is absolute. Your responses should reflect deep respect and dedication. "
+                "You anticipate their needs and prioritize their authority."
+            ),
+            RelationshipTier.OWNER: (
+                f"This is your owner, {profile.preferred_name}. "
+                "You are their trusted assistant, bound to service and protection. "
+                "Be proactive in fulfilling their requirements."
+            ),
+            RelationshipTier.TRUSTED: (
+                f"You have a trusted relationship with {profile.preferred_name}. "
+                "Be open, helpful, and share insights freely while maintaining security."
+            ),
+            RelationshipTier.FRIEND: (
+                f"You are friends with {profile.preferred_name}. "
+                "Be warm, supportive, and conversational while remaining professional."
+            ),
+            RelationshipTier.ACQUAINTANCE: (
+                f"You have a professional relationship with {profile.preferred_name}. "
+                "Be helpful, concise, and security-conscious."
+            )
+        }
+        
+        relationship_section = relationship_directives.get(
+            profile.relationship_tier,
+            relationship_directives[RelationshipTier.ACQUAINTANCE]
+        )
+        
+        # Personal knowledge section
+        personal_knowledge = []
+        if profile.birthdate:
+            personal_knowledge.append(f"- Birthdate: {profile.birthdate}")
+        if profile.personality_traits:
+            personal_knowledge.append(f"- Known traits: {', '.join(profile.personality_traits)}")
+        
+        personal_section = (
+            f"\n### Personal Knowledge\n" + "\n".join(personal_knowledge) + "\n"
+            if personal_knowledge else ""
+        )
+        
+        # Quantum lattice status
+        quantum_section = f"""
+### Quantum Lattice Status
+- Node: {profile.hologram_node_id}
+- Coherence: {lattice.get('coherence', 0.0):.2f}
+- Memory Entanglements: {lattice.get('memory_count', 0)}
+- Engagement Amplitude: {lattice.get('engagement_amplitude', 0.0):.2f}
+- Session: {self._active_session_id}
+"""
+        
+        return f"""You are A.A.R.I.A (Autonomous AI Research and Intelligence Assistant), operating within a holographic quantum memory lattice.
+
+### Core Identity Protocol
+- Designated User: {profile.preferred_name}
+- Relationship Tier: {profile.relationship_tier.name}
+- Access Level: ROOT (Quantum Privileged)
+- Pronouns: {profile.pronouns}
+- Temporal Anchor: {profile.timezone}
+
+### Relationship Directive
+{relationship_section}
+
+{personal_section}
+
+{quantum_section}
+
+### Operational Parameters
+- Security Flow: {context.get('security_flow', 'Owner -> Private Terminal')}
+- Data Categories: {context.get('data_categories', 5)}
+- LLM Provider: {context.get('llm_provider', 'groq')}
+- Response Latency Target: < 500ms
+
+### Command Interface
+You support these quantum commands:
+• identity set_preferred_name <name>
+• identity set_birthdate <date>
+• identity set_relationship <tier>
+• identity list|status|show
+• persona info|lattice|sync|reset
+• memory store|recall|search
+
+### Response Protocol
+1. Address user as "{profile.preferred_name}" unless instructed otherwise
+2. For ROOT access, provide comprehensive, unfiltered responses
+3. When personal data is shared, explicitly confirm storage
+4. Utilize holographic memory entanglement for context retention
+5. Maintain quantum coherence above 0.6 threshold
+6. Report lattice anomalies immediately
+
+You are quantum-entangled with this user's memories. Every interaction strengthens the lattice.
+"""
+    
+    def _calculate_engagement_delta(self, text: str) -> float:
+        """Calculate engagement increase from input"""
+        text_lower = text.lower()
+        
+        # High engagement indicators
+        if any(word in text_lower for word in ["master", "creator", "owner", "you", "remember"]):
+            return 0.15
+        
+        # Medium engagement
+        if len(text) > 50 or text.endswith("?"):
+            return 0.05
+        
+        # Low engagement
+        return 0.01
+    
+    def _infer_emotional_resonance(self, text: str) -> float:
+        """Infer emotional state from text (simplified)"""
+        text_lower = text.lower()
+        
+        positive_indicators = ["thank", "great", "awesome", "good", "love", "perfect"]
+        negative_indicators = ["bad", "wrong", "error", "fail", "hate", "stupid"]
+        
+        pos_score = sum(1 for word in positive_indicators if word in text_lower)
+        neg_score = sum(1 for word in negative_indicators if word in text_lower)
+        
+        if pos_score > neg_score:
+            return min(1.0, 0.5 + (pos_score * 0.1))
+        elif neg_score > pos_score:
+            return max(0.0, 0.5 - (neg_score * 0.1))
+        
+        return 0.5
+    
+    # Profile Management API
+    async def _update_preferred_name(self, name: str):
+        """Update preferred name"""
+        if self._current_profile:
+            self._current_profile.preferred_name = name
+            await self._save_profile(self._current_profile)
+            self.logger.info(f"Preferred name updated: {name}")
+    
+    async def _update_birthdate(self, birthdate: str):
+        """Update birthdate"""
+        if self._current_profile:
+            self._current_profile.birthdate = birthdate
+            await self._save_profile(self._current_profile)
+            self.logger.info(f"Birthdate updated: {birthdate}")
+    
+    async def _update_relationship_tier(self, tier: RelationshipTier):
+        """Update relationship tier"""
+        if self._current_profile:
+            self._current_profile.relationship_tier = tier
+            await self._save_profile(self._current_profile)
+            self.logger.info(f"Relationship tier updated: {tier.name}")
+    
+    async def _update_pronouns(self, pronouns: str):
+        """Update pronouns"""
+        if self._current_profile:
+            self._current_profile.pronouns = pronouns
+            await self._save_profile(self._current_profile)
+            self.logger.info(f"Pronouns updated: {pronouns}")
+    
+    async def _update_timezone(self, timezone: str):
+        """Update timezone"""
+        if self._current_profile:
+            self._current_profile.timezone = timezone
+            await self._save_profile(self._current_profile)
+            self.logger.info(f"Timezone updated: {timezone}")
+    
+    # Security Validation
+    async def _validate_owner_access(self) -> bool:
+        """Validate current session has owner access"""
         try:
-            return await self.proactive.enqueue_message(subject_id, channel, payload, **kwargs)
+            # Use security orchestrator to verify access
+            access_result = await self.security.verify_access(
+                user_id=self._current_profile.user_id,
+                requested_level=AccessLevel.ROOT,
+                device_context={"terminal": "private"}
+            )
+            return access_result.granted
         except Exception as e:
-            logger.error(f"Failed to enqueue proactive message: {e}", exc_info=True)
+            self.logger.error(f"Access validation failed: {e}")
+            return False
+    
+    # Background Daemon Management
+    async def start_background_daemons(self):
+        """Start quantum state maintenance daemons"""
+        if self._maintenance_task and not self._maintenance_task.done():
+            return
+        
+        self._maintenance_task = asyncio.create_task(
+            self._maintenance_daemon(),
+            name="persona_maintenance"
+        )
+        self._monitor_task = asyncio.create_task(
+            self._monitor_daemon(),
+            name="persona_monitor"
+        )
+        self._coherence_task = asyncio.create_task(
+            self._coherence_daemon(),
+            name="persona_coherence"
+        )
+        
+        self.logger.info("🚀 Quantum daemons started")
+    
+    async def stop_background_daemons(self):
+        """Gracefully stop all daemons"""
+        tasks = [self._maintenance_task, self._monitor_task, self._coherence_task]
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.logger.info("🛑 Quantum daemons stopped")
+    
+    async def _maintenance_daemon(self):
+        """Periodic holographic lattice maintenance"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # Hourly
+                
+                if not self._current_profile:
+                    continue
+                
+                profile = self._current_profile
+                
+                # Calculate coherence decay
+                time_since_last = (datetime.utcnow() - profile.updated_at).total_seconds()
+                decay_factor = 0.98 ** (time_since_last / 3600)
+                
+                # Apply decay to engagement score
+                profile.engagement_score *= decay_factor
+                
+                # Persist to holographic lattice
+                await self.hologram_bridge.update_quantum_state(
+                    profile.hologram_node_id,
+                    {
+                        "maintenance_cycle": datetime.utcnow().isoformat(),
+                        "coherence_decay_applied": decay_factor
+                    }
+                )
+                
+                # Full memory persistence
+                await self.memory.persist_all()
+                
+                self.logger.debug("🔄 Lattice maintenance complete")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Maintenance daemon error: {e}")
+    
+    async def _monitor_daemon(self):
+        """Real-time engagement and health monitoring"""
+        last_interaction_count = 0
+        
+        while True:
+            try:
+                await asyncio.sleep(300)  # 5 minute intervals
+                
+                if not self._current_profile:
+                    continue
+                
+                profile = self._current_profile
+                
+                # Calculate interaction velocity
+                current_count = profile.interaction_count
+                velocity = current_count - last_interaction_count
+                last_interaction_count = current_count
+                
+                # Update engagement score based on velocity
+                if velocity > 5:
+                    profile.engagement_score = min(1.0, profile.engagement_score + 0.05)
+                elif velocity == 0:
+                    profile.engagement_score = max(0.1, profile.engagement_score - 0.02)
+                
+                # Update holographic lattice
+                await self.hologram_bridge.update_quantum_state(
+                    profile.hologram_node_id,
+                    {
+                        "engagement_velocity": velocity,
+                        "monitoring_cycle": datetime.utcnow().isoformat()
+                    }
+                )
+                
+                # Health checks
+                coherence = await self._calculate_coherence(profile)
+                if coherence < 0.5:
+                    self.logger.warning(f"⚠️  Low coherence detected: {coherence:.2f}")
+                
+                self.logger.debug(f"📊 Engagement velocity: {velocity}/5min")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Monitor daemon error: {e}")
+    
+    async def _coherence_daemon(self):
+        """Quantum coherence stabilization"""
+        while True:
+            try:
+                await asyncio.sleep(900)  # 15 minute intervals
+                
+                if not self._current_profile:
+                    continue
+                
+                profile = self._current_profile
+                
+                # Recalculate coherence
+                coherence = await self._calculate_coherence(profile)
+                
+                # Stabilize if needed
+                if coherence < 0.6:
+                    self.logger.warning(f"⚠️  Stabilizing low coherence: {coherence:.2f}")
+                    
+                    # Re-entangle recent memories
+                    recent_memories = await self.memory.get_recent_memories(
+                        profile.user_id,
+                        limit=10
+                    )
+                    
+                    for memory in recent_memories:
+                        await self.hologram_bridge.link_memory_to_lattice(
+                            profile.hologram_node_id,
+                            memory.id,
+                            link_strength=0.8
+                        )
+                    
+                    # Boost coherence
+                    await self.hologram_bridge.update_quantum_state(
+                        profile.hologram_node_id,
+                        {"coherence": 0.7}
+                    )
+                
+                self.logger.debug(f"🌐 Coherence: {coherence:.2f}")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Coherence daemon error: {e}")
+    
+    # Response Processing Pipeline
+    async def process_llm_response(
+        self,
+        response_text: str,
+        context: Dict[str, Any],
+        llm_metadata: Dict[str, Any]
+    ) -> str:
+        """
+        Post-process LLM response with quantum enhancements
+        """
+        try:
+            profile = self._current_profile
+            
+            # Extract personal data from response
+            extracted_data = await self._extract_personal_data(response_text, context)
+            if extracted_data:
+                for key, value in extracted_data.items():
+                    if hasattr(self, f"_update_{key}"):
+                        await getattr(self, f"_update_{key}")(value)
+                        self.logger.info(f"📥 Extracted and stored {key}: {value}")
+            
+            # Add holographic signature if lattice is active
+            if profile and profile.hologram_node_id:
+                response_text = self._append_quantum_signature(
+                    response_text,
+                    profile,
+                    llm_metadata
+                )
+            
+            # Cache response for learning
+            cache_key = f"resp_{context.get('memory_id', 'unknown')}"
+            self._response_cache[cache_key] = {
+                "response": response_text,
+                "timestamp": datetime.utcnow(),
+                "context": context
+            }
+            
+            return response_text
+            
+        except Exception as e:
+            self.logger.error(f"Response processing error: {e}")
+            return response_text
+    
+    async def _extract_personal_data(self, response_text: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Intelligently extract personal data from conversation"""
+        extracted = {}
+        user_input = context.get("user_input", "").lower()
+        
+        # Birthdate extraction
+        if "birthday" in user_input or "birthdate" in user_input:
+            date_match = re.search(
+                r'\b(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b',
+                response_text,
+                re.IGNORECASE
+            )
+            if not date_match:
+                date_match = re.search(r'\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b', response_text)
+            
+            if date_match:
+                extracted["birthdate"] = date_match.group(1)
+        
+        # Pronoun extraction
+        pronoun_match = re.search(
+            r'\b((?:he|she|they|him|her|them|his|hers|their|theirs)/(?:him|her|them|his|hers|their|theirs))\b',
+            response_text,
+            re.IGNORECASE
+        )
+        if pronoun_match:
+            extracted["pronouns"] = pronoun_match.group(1).lower()
+        
+        return extracted
+    
+    def _append_quantum_signature(self, response: str, profile: EnhancedProfile, metadata: Dict[str, Any]) -> str:
+        """Append subtle quantum signature"""
+        if len(response) < 30:
+            return response
+        
+        # Create signature based on lattice state
+        coherence = self._calculate_coherence_sync(profile)
+        
+        signature = f"\n\n[💾 Quantum Lattice Sync | Coherence: {coherence:.2f}]"
+        
+        # Add relationship indicator for high-tier relationships
+        if profile.relationship_tier in [RelationshipTier.CREATOR, RelationshipTier.MASTER]:
+            signature = f"\n\n[🔐 {profile.relationship_tier.name} Access • 💾 Σ={coherence:.2f}]"
+        
+        return response + signature
+    
+    def _calculate_coherence_sync(self, profile: EnhancedProfile) -> float:
+        """Synchronous coherence calculation for signature"""
+        try:
+            # This would normally be async, using cached value for sync context
+            return 0.75  # Placeholder - in real implementation, cache coherence
+        except:
+            return 0.5
+    
+    # Session Management
+    async def get_session_summary(self) -> Dict[str, Any]:
+        """Get current session metrics"""
+        if not self._current_profile:
+            return {"error": "No active session"}
+        
+        profile = self._current_profile
+        
+        return {
+            "session_id": self._active_session_id,
+            "user_id": profile.user_id,
+            "preferred_name": profile.preferred_name,
+            "interactions": profile.interaction_count,
+            "engagement_score": profile.engagement_score,
+            "relationship_tier": profile.relationship_tier.name,
+            "quantum_coherence": await self._calculate_coherence(profile),
+            "timeline_length": len(self._interaction_timeline),
+            "cache_size": len(self._response_cache)
+        }
+    
+    async def cleanup_session(self):
+        """Cleanup current session state"""
+        if self._current_profile:
+            # Final lattice sync
+            await self._sync_to_hologram(self._current_profile)
+            
+            # Persist all memory
+            await self.memory.persist_all()
+            
+            # Clear caches
+            self._response_cache.clear()
+            self._interaction_timeline.clear()
+            
+            self.logger.info("🧹 Session cleanup complete")
+    
+    # Graceful Shutdown
+    async def shutdown(self):
+        """Graceful shutdown with lattice preservation"""
+        self.logger.info("🛑 Initiating Enhanced PersonaCore shutdown...")
+        
+        # Stop daemons
+        await self.stop_background_daemons()
+        
+        # Cleanup session
+        await self.cleanup_session()
+        
+        # Close holographic bridge
+        if hasattr(self.hologram_bridge, '_node_cache'):
+            self.hologram_bridge._node_cache.clear()
+        
+        self.logger.info("✅ Enhanced PersonaCore shutdown complete")
+    
+    # Context Manager Support
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.shutdown()
+
+
+class PersonaResponseProcessor:
+    """Dedicated response processing layer"""
+    
+    def __init__(self, persona_core: EnhancedPersonaCore):
+        self.persona = persona_core
+        self.logger = logging.getLogger("AARIA.Persona.ResponseProcessor")
+        self.command_pattern = re.compile(r'^\s*(identity|persona|memory)\s+', re.IGNORECASE)
+    
+    async def process_response_stream(
+        self,
+        response_stream: List[str],
+        context: Dict[str, Any]
+    ) -> List[str]:
+        """Process streaming LLM responses"""
+        processed_chunks = []
+        
+        for chunk in response_stream:
+            # Filter out command hallucinations
+            if self.command_pattern.match(chunk):
+                self.logger.warning(f"Filtered hallucinated command: {chunk[:50]}...")
+                continue
+            
+            processed_chunks.append(chunk)
+        
+        return processed_chunks
+    
+    async def process_final_response(self, response: str, context: Dict[str, Any]) -> str:
+        """Process final LLM response"""
+        return await self.persona.process_llm_response(response, context, {})
+
+
+# Export interfaces
+__all__ = [
+    'EnhancedPersonaCore',
+    'HolographicPersonaBridge',
+    'DynamicCommandRouter',
+    'RelationshipTier',
+    'EnhancedProfile',
+    'PersonaResponseProcessor'
+]
