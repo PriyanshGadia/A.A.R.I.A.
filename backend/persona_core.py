@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import re
-import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Union, Callable
 from uuid import uuid4
@@ -18,7 +17,7 @@ from enum import Enum
 from llm_adapter import LLMAdapterFactory, LLMRequest
 from security_orchestrator import SecurityOrchestrator, AccessLevel
 from identity_manager import IdentityManager, UserIdentity
-from memory_manager import DualMemoryManager, MemoryContainer, MemoryEntry
+from memory_manager import MemoryManager, MemoryContainer, MemoryEntry
 from hologram_state import HologramState, HolographicNode, HolographicLink
 from proactive_comm import ProactiveCommunicator
 from autonomy_core import AutonomyCore
@@ -496,21 +495,18 @@ class EnhancedPersonaCore:
     
     def __init__(
         self,
-        identity_manager: IdentityManager,
-        memory_manager: DualMemoryManager,
-        security_orchestrator: SecurityOrchestrator,
-        hologram_state: HologramState,
-        llm_factory: LLMAdapterFactory,
+        core: Any, # The AssistantCore instance
         proactive_communicator: Optional[ProactiveCommunicator] = None,
         autonomy_core: Optional[AutonomyCore] = None
     ):
-        # Core dependencies
-        self.identity = identity_manager
-        self.memory = memory_manager
-        self.security = security_orchestrator
-        self.llm = llm_factory
-        self.proactive = proactive_communicator
-        self.autonomy = autonomy_core
+        # Core dependencies extracted from AssistantCore
+        self.identity: IdentityManager = core.identity_manager
+        self.memory: MemoryManager = core.memory_manager
+        self.security: SecurityOrchestrator = core.security_orchestrator
+        self.llm: LLMAdapterFactory = core.llm_adapter_factory # Assuming AssistantCore holds this
+        self.proactive = proactive_communicator or core.proactive # Use provided or from core
+        self.autonomy = autonomy_core or getattr(core, 'autonomy', None) # Use provided or from core
+        self.core = core # Keep a reference to the assistant core
         
         # Initialize logger
         self.logger = logging.getLogger("AARIA.Persona")
@@ -694,7 +690,8 @@ class EnhancedPersonaCore:
             metadata={
                 "type": "quantum_interaction",
                 "engagement_score": profile.engagement_score
-            }
+            },
+            persona_node_id=profile.hologram_node_id
         )
         
         # Entangle memory with persona lattice
@@ -735,6 +732,30 @@ class EnhancedPersonaCore:
             },
             "llm_metadata": llm_metadata or {}
         }
+
+    async def store_memory(self, user_input: str, assistant_response: str, subject_identity_id: str, importance: int, metadata: Dict):
+        if not self._current_profile or self._current_profile.user_id != subject_identity_id:
+            persona_node_id = None
+        else:
+            persona_node_id = self._current_profile.hologram_node_id
+
+        memory_id = f"mem_auto_{uuid4().hex[:12]}"
+        interaction_content = {
+            "user_input": user_input,
+            "assistant_response": assistant_response,
+        }
+        
+        await self.memory.store_interaction(
+            user_id=subject_identity_id,
+            memory_id=memory_id,
+            content=interaction_content,
+            metadata={
+                "type": "autonomy_action_result",
+                "importance": importance,
+                **metadata
+            },
+            persona_node_id=persona_node_id
+        )
     
     async def _construct_quantum_prompt(self, profile: EnhancedProfile, context: Dict[str, Any]) -> str:
         """Construct quantum-aware system prompt with lattice context"""

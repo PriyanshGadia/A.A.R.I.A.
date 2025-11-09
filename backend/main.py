@@ -48,7 +48,7 @@ try: from secure_store import SecureStorageAsync
 except Exception: SecureStorageAsync = None
 try: from assistant_core import AssistantCore
 except Exception: AssistantCore = None
-try: from persona_core import PersonaCore
+try: from persona_core import EnhancedPersonaCore as PersonaCore
 except Exception: PersonaCore = None
 try: from cognition_core import CognitionCore
 except Exception: CognitionCore = None
@@ -220,6 +220,10 @@ class AARIASystem:
             await security.initialize()
             self.components["security"] = security
             assistant.security_orchestrator = security # Inject back into core
+            if hasattr(security, 'identity_manager'):
+                assistant.identity_manager = security.identity_manager
+            if LLMAdapterFactory:
+                assistant.llm_adapter_factory = LLMAdapterFactory
 
             # 3. Hologram
             await self._hologram_call("initialize_base_state")
@@ -228,7 +232,7 @@ class AARIASystem:
             # 4. Memory Manager (Root Database)
             self.logger.info("Initializing Memory Manager...")
             if MemoryManager:
-                memory_manager = MemoryManager(assistant_core=assistant)
+                memory_manager = MemoryManager()
                 # If MemoryManager has async initialize, call it
                 if hasattr(memory_manager, "initialize") and inspect.iscoroutinefunction(memory_manager.initialize):
                     await memory_manager.initialize()
@@ -271,7 +275,6 @@ class AARIASystem:
             persona.proactive = proactive # Inject the *instance*
             # --- [END INJECTION] ---
             
-            await persona.initialize()
             assistant.persona = persona
             self.components["persona"] = persona
 
@@ -286,6 +289,7 @@ class AARIASystem:
                 )
                 await autonomy.initialize()
                 self.components["autonomy"] = autonomy
+                persona.autonomy = autonomy # Inject autonomy back into persona
             
             # 8. Cognition Core (The "Brain")
             if CognitionCore is not None:
@@ -307,13 +311,11 @@ class AARIASystem:
                 return False
             self.logger.info("Initializing Interaction Core with Enhanced Security...")
             interaction = await create_interaction_core(
-                persona=persona,
-                cognition=self.components.get("cognition"),
-                autonomy=self.components.get("autonomy"),
-                config={
-                    "session_ttl": self.config.get("session_timeout", 3600),
-                    "security_orchestrator": security, # Inject Security
-                }
+                security_orchestrator=security,
+                cognition_core=self.components.get("cognition"),
+                autonomy_core=self.components.get("autonomy"),
+                proactive_communicator=proactive,
+                assistant_core=assistant
             )
             self.components["interaction"] = interaction
             
@@ -519,23 +521,16 @@ class AARIASystem:
                 # All input now goes directly to the agent.
                 # --- [END DELETED] ---
 
-                # Build inbound message
+                # Build user context dictionary
                 message_count += 1
-                if InboundMessage is None:
-                     print("A.A.R.I.A: FATAL: InboundMessage class not loaded.")
-                     continue
-                     
-                inbound = InboundMessage(
-                    channel="cli",
-                    content=user_input,
-                    user_id=user_name,
-                    metadata={
-                        "message_number": message_count,
-                        "device_id": "cli_terminal",
-                        "source": "private_terminal",
-                        "user_name": user_name
-                    }
-                )
+                user_context = {
+                    "user_id": user_name,
+                    "device_id": "cli_terminal",
+                    "channel": "cli",
+                    "source": "private_terminal",
+                    "user_name": user_name,
+                    "message_number": message_count
+                }
 
                 try:
                     interaction = self.components.get("interaction")
@@ -543,9 +538,12 @@ class AARIASystem:
                         print("A.A.R.I.A: Interaction component missing.")
                         continue
 
-                    response = await interaction.handle_inbound(inbound)
+                    response = await interaction.process_message(
+                        message=user_input,
+                        user_context=user_context
+                    )
 
-                    content = getattr(response, "content", None) or (response if isinstance(response, str) else None)
+                    content = response if isinstance(response, str) else None
                     if content:
                         successful_responses += 1
                         print(f"A.A.R.I.A: {content}")

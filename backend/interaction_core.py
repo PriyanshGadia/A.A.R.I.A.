@@ -92,7 +92,7 @@ class EnhancedInteractionCore:
     
     def __init__(self, 
                  security_orchestrator: SecurityOrchestrator, 
-                 cognition_core: CognitionCore,
+                 cognition_core: Optional[CognitionCore] = None,
                  autonomy_core: Optional[AutonomyCore] = None,
                  proactive_communicator: Optional[ProactiveCommunicator] = None,
                  assistant_core: Optional[AssistantCore] = None):
@@ -934,6 +934,8 @@ class EnhancedInteractionCore:
                                       security_context: Dict[str, Any],
                                       session: InteractionSession) -> str:
         """Process natural language through cognition core with enhanced context"""
+        if not self.cognition_core:
+            return "Cognition core is not available."
         try:
             # Enhance context with security and session information
             enhanced_context = {
@@ -1492,7 +1494,7 @@ class EnhancedInteractionCore:
 # Factory function for creating InteractionCore instance
 async def create_interaction_core(
     security_orchestrator: SecurityOrchestrator, 
-    cognition_core: CognitionCore,
+    cognition_core: Optional[CognitionCore] = None,
     autonomy_core: Optional[AutonomyCore] = None,
     proactive_communicator: Optional[ProactiveCommunicator] = None,
     assistant_core: Optional[AssistantCore] = None
